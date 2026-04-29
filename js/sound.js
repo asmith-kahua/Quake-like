@@ -109,20 +109,49 @@ window.Game.Sound = class {
   }
 
   // Internal: build a one-shot gain that connects to master and auto-disconnects.
+  // The returned gain exposes a `_track(node)` method — every intermediate node
+  // (oscillator, BufferSource, BiquadFilter, modulation gain, etc.) connected
+  // upstream of this gain MUST be tracked so it can be disconnected once the
+  // envelope ends. Without this, AudioParam-bound nodes and filters accumulate
+  // in the AudioContext graph and cause Web Audio scheduler latency spikes.
   _voice(durationSec, peakVolume) {
     const g = this.ctx.createGain();
     g.gain.value = 0;
     g.connect(this.masterGain);
     const self = this;
     self.activeVoices++;
-    // Schedule disconnect a hair after the envelope ends.
-    const ms = Math.max(20, Math.ceil(durationSec * 1000) + 60);
-    setTimeout(function () {
+    const tracked = [];
+    let cleaned = false;
+    g._track = function (node) {
+      if (node) tracked.push(node);
+      return node;
+    };
+    function cleanup() {
+      if (cleaned) return;
+      cleaned = true;
+      for (let i = 0; i < tracked.length; i++) {
+        try { tracked[i].disconnect(); } catch (e) { }
+      }
+      tracked.length = 0;
       try { g.disconnect(); } catch (e) { }
       self.activeVoices = Math.max(0, self.activeVoices - 1);
-    }, ms);
+    }
+    g._cleanup = cleanup;
+    // Fallback: if no source node fires `onended` (e.g. exception before .start),
+    // a setTimeout still releases the graph nodes. Add ample slack.
+    const ms = Math.max(20, Math.ceil(durationSec * 1000) + 120);
+    setTimeout(cleanup, ms);
     g._peak = peakVolume;
     return g;
+  }
+
+  // Internal: wire a source node (oscillator / BufferSource) so its `onended`
+  // event drives the voice cleanup. This is the deterministic path; the
+  // `_voice` setTimeout is just a safety net.
+  _bindEnd(src, voiceGain) {
+    if (!src || !voiceGain || typeof voiceGain._cleanup !== 'function') return src;
+    src.onended = voiceGain._cleanup;
+    return src;
   }
 
   // Internal: short noise BufferSource using the shared 1s buffer with random offset.
@@ -200,6 +229,7 @@ window.Game.Sound = class {
       hp.frequency.value = 1800;
       hp.Q.value = 0.7;
       const ng = this._voice(noiseDur, 0.9 * vol);
+      ng._track(noise); ng._track(hp);
       ng.gain.cancelScheduledValues(t0);
       ng.gain.setValueAtTime(0.0001, t0);
       ng.gain.exponentialRampToValueAtTime(0.9 * vol + 0.0001, t0 + 0.002);
@@ -207,6 +237,7 @@ window.Game.Sound = class {
       noise.connect(hp); hp.connect(ng);
       noise.start(t0);
       noise.stop(t0 + noiseDur + 0.01);
+      this._bindEnd(noise, ng);
 
       // 2) Quick downward saw chirp
       const osc = ctx.createOscillator();
@@ -214,12 +245,14 @@ window.Game.Sound = class {
       osc.frequency.setValueAtTime(900, t0);
       osc.frequency.exponentialRampToValueAtTime(120, t0 + dur);
       const og = this._voice(dur, 0.35 * vol);
+      og._track(osc);
       og.gain.setValueAtTime(0.0001, t0);
       og.gain.exponentialRampToValueAtTime(0.35 * vol + 0.0001, t0 + 0.005);
       og.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
       osc.connect(og);
       osc.start(t0);
       osc.stop(t0 + dur + 0.01);
+      this._bindEnd(osc, og);
     } catch (e) { }
   }
 
@@ -237,12 +270,14 @@ window.Game.Sound = class {
       lp.frequency.exponentialRampToValueAtTime(180, t0 + dur);
       lp.Q.value = 1.0;
       const ng = this._voice(dur, 0.7 * vol);
+      ng._track(noise); ng._track(lp);
       ng.gain.setValueAtTime(0.0001, t0);
       ng.gain.exponentialRampToValueAtTime(0.7 * vol + 0.0001, t0 + 0.02);
       ng.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
       noise.connect(lp); lp.connect(ng);
       noise.start(t0);
       noise.stop(t0 + dur + 0.02);
+      this._bindEnd(noise, ng);
 
       // Low-end rumble oscillator
       const osc = ctx.createOscillator();
@@ -257,9 +292,11 @@ window.Game.Sound = class {
       const olp = ctx.createBiquadFilter();
       olp.type = 'lowpass';
       olp.frequency.value = 400;
+      og._track(osc); og._track(olp);
       osc.connect(olp); olp.connect(og);
       osc.start(t0);
       osc.stop(t0 + dur + 0.02);
+      this._bindEnd(osc, og);
     } catch (e) { }
   }
 
@@ -277,12 +314,14 @@ window.Game.Sound = class {
       lp.frequency.exponentialRampToValueAtTime(150, t0 + dur);
       lp.Q.value = 0.9;
       const ng = this._voice(dur, 0.95 * vol);
+      ng._track(noise); ng._track(lp);
       ng.gain.setValueAtTime(0.0001, t0);
       ng.gain.exponentialRampToValueAtTime(0.95 * vol + 0.0001, t0 + 0.01);
       ng.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
       noise.connect(lp); lp.connect(ng);
       noise.start(t0);
       noise.stop(t0 + dur + 0.02);
+      this._bindEnd(noise, ng);
 
       // Low oscillator thump
       const osc = ctx.createOscillator();
@@ -290,12 +329,14 @@ window.Game.Sound = class {
       osc.frequency.setValueAtTime(140, t0);
       osc.frequency.exponentialRampToValueAtTime(35, t0 + 0.35);
       const og = this._voice(0.4, 0.8 * vol);
+      og._track(osc);
       og.gain.setValueAtTime(0.0001, t0);
       og.gain.exponentialRampToValueAtTime(0.8 * vol + 0.0001, t0 + 0.02);
       og.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.4);
       osc.connect(og);
       osc.start(t0);
       osc.stop(t0 + 0.42);
+      this._bindEnd(osc, og);
     } catch (e) { }
   }
 
@@ -312,12 +353,14 @@ window.Game.Sound = class {
       bp.frequency.value = 1200;
       bp.Q.value = 4;
       const ng = this._voice(dur, 0.55 * vol);
+      ng._track(noise); ng._track(bp);
       ng.gain.setValueAtTime(0.0001, t0);
       ng.gain.exponentialRampToValueAtTime(0.55 * vol + 0.0001, t0 + 0.005);
       ng.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
       noise.connect(bp); bp.connect(ng);
       noise.start(t0);
       noise.stop(t0 + dur + 0.01);
+      this._bindEnd(noise, ng);
 
       // Quick descending sine
       const osc = ctx.createOscillator();
@@ -325,12 +368,14 @@ window.Game.Sound = class {
       osc.frequency.setValueAtTime(700, t0);
       osc.frequency.exponentialRampToValueAtTime(260, t0 + dur);
       const og = this._voice(dur, 0.35 * vol);
+      og._track(osc);
       og.gain.setValueAtTime(0.0001, t0);
       og.gain.exponentialRampToValueAtTime(0.35 * vol + 0.0001, t0 + 0.005);
       og.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
       osc.connect(og);
       osc.start(t0);
       osc.stop(t0 + dur + 0.01);
+      this._bindEnd(osc, og);
     } catch (e) { }
   }
 
@@ -358,9 +403,11 @@ window.Game.Sound = class {
         lp.type = 'lowpass';
         lp.frequency.setValueAtTime(1500, t0);
         lp.frequency.exponentialRampToValueAtTime(300, t0 + dur);
+        og._track(osc); og._track(lp);
         osc.connect(lp); lp.connect(og);
         osc.start(t0);
         osc.stop(t0 + dur + 0.02);
+        this._bindEnd(osc, og);
       }
     } catch (e) { }
   }
@@ -380,12 +427,14 @@ window.Game.Sound = class {
       bp.frequency.value = 700;
       bp.Q.value = 1.5;
       const og = this._voice(dur, 0.55 * vol);
+      og._track(osc); og._track(bp);
       og.gain.setValueAtTime(0.0001, t0);
       og.gain.exponentialRampToValueAtTime(0.55 * vol + 0.0001, t0 + 0.005);
       og.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
       osc.connect(bp); bp.connect(og);
       osc.start(t0);
       osc.stop(t0 + dur + 0.01);
+      this._bindEnd(osc, og);
     } catch (e) { }
   }
 
@@ -403,12 +452,14 @@ window.Game.Sound = class {
         osc.type = 'sine';
         osc.frequency.value = notes[i];
         const og = this._voice(start - t0 + noteDur, 0.35 * vol);
+        og._track(osc);
         og.gain.setValueAtTime(0.0001, start);
         og.gain.exponentialRampToValueAtTime(0.35 * vol + 0.0001, start + 0.01);
         og.gain.exponentialRampToValueAtTime(0.0001, start + noteDur);
         osc.connect(og);
         osc.start(start);
         osc.stop(start + noteDur + 0.01);
+        this._bindEnd(osc, og);
       }
     } catch (e) { }
   }
@@ -432,12 +483,21 @@ window.Game.Sound = class {
       mod.connect(modGain); modGain.connect(carrier.frequency);
 
       const og = this._voice(dur, 0.45 * vol);
+      // Track every node we created upstream of `og`, including the modulator
+      // chain whose `modGain` is connected to an AudioParam (carrier.frequency).
+      // AudioParam-bound nodes are NOT torn down by `og.disconnect()` alone —
+      // without explicit disconnects here, they pile up in the AudioContext
+      // graph on every pickup and cause the lag the user reported.
+      og._track(carrier); og._track(mod); og._track(modGain);
       og.gain.setValueAtTime(0.0001, t0);
       og.gain.exponentialRampToValueAtTime(0.45 * vol + 0.0001, t0 + 0.005);
       og.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
       carrier.connect(og);
       mod.start(t0); carrier.start(t0);
       mod.stop(t0 + dur + 0.01); carrier.stop(t0 + dur + 0.01);
+      // Use the carrier's onended (it gates the audible voice). `mod` ends at
+      // the same time, so its disconnect happens via the tracked-list cleanup.
+      this._bindEnd(carrier, og);
 
       // Noise click on the front
       const clickDur = 0.025;
@@ -446,12 +506,14 @@ window.Game.Sound = class {
       hp.type = 'highpass';
       hp.frequency.value = 2500;
       const ng = this._voice(clickDur, 0.4 * vol);
+      ng._track(noise); ng._track(hp);
       ng.gain.setValueAtTime(0.0001, t0);
       ng.gain.exponentialRampToValueAtTime(0.4 * vol + 0.0001, t0 + 0.001);
       ng.gain.exponentialRampToValueAtTime(0.0001, t0 + clickDur);
       noise.connect(hp); hp.connect(ng);
       noise.start(t0);
       noise.stop(t0 + clickDur + 0.005);
+      this._bindEnd(noise, ng);
     } catch (e) { }
   }
 
@@ -467,6 +529,7 @@ window.Game.Sound = class {
         osc.type = 'sine';
         osc.frequency.value = notes[i];
         const og = this._voice(dur, 0.28 * vol);
+        og._track(osc);
         og.gain.setValueAtTime(0.0001, t0);
         og.gain.exponentialRampToValueAtTime(0.28 * vol + 0.0001, t0 + 0.04);
         og.gain.setValueAtTime(0.28 * vol, t0 + dur - 0.15);
@@ -474,6 +537,7 @@ window.Game.Sound = class {
         osc.connect(og);
         osc.start(t0);
         osc.stop(t0 + dur + 0.02);
+        this._bindEnd(osc, og);
       }
     } catch (e) { }
   }
@@ -490,12 +554,14 @@ window.Game.Sound = class {
       osc.frequency.setValueAtTime(180, t0);
       osc.frequency.exponentialRampToValueAtTime(40, t0 + dur);
       const og = this._voice(dur, 0.7 * vol);
+      og._track(osc);
       og.gain.setValueAtTime(0.0001, t0);
       og.gain.exponentialRampToValueAtTime(0.7 * vol + 0.0001, t0 + 0.02);
       og.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
       osc.connect(og);
       osc.start(t0);
       osc.stop(t0 + dur + 0.02);
+      this._bindEnd(osc, og);
 
       // Noise hit at the very start
       const nDur = 0.08;
@@ -504,12 +570,14 @@ window.Game.Sound = class {
       lp.type = 'lowpass';
       lp.frequency.value = 800;
       const ng = this._voice(nDur, 0.5 * vol);
+      ng._track(noise); ng._track(lp);
       ng.gain.setValueAtTime(0.0001, t0);
       ng.gain.exponentialRampToValueAtTime(0.5 * vol + 0.0001, t0 + 0.002);
       ng.gain.exponentialRampToValueAtTime(0.0001, t0 + nDur);
       noise.connect(lp); lp.connect(ng);
       noise.start(t0);
       noise.stop(t0 + nDur + 0.01);
+      this._bindEnd(noise, ng);
     } catch (e) { }
   }
 
@@ -523,12 +591,14 @@ window.Game.Sound = class {
       osc.frequency.setValueAtTime(220, t0);
       osc.frequency.exponentialRampToValueAtTime(150, t0 + dur);
       const og = this._voice(dur, 0.18 * vol);
+      og._track(osc);
       og.gain.setValueAtTime(0.0001, t0);
       og.gain.exponentialRampToValueAtTime(0.18 * vol + 0.0001, t0 + 0.005);
       og.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
       osc.connect(og);
       osc.start(t0);
       osc.stop(t0 + dur + 0.01);
+      this._bindEnd(osc, og);
     } catch (e) { }
   }
 
@@ -543,12 +613,14 @@ window.Game.Sound = class {
       bp.frequency.value = 3000;
       bp.Q.value = 6;
       const ng = this._voice(dur, 0.5 * vol);
+      ng._track(noise); ng._track(bp);
       ng.gain.setValueAtTime(0.0001, t0);
       ng.gain.exponentialRampToValueAtTime(0.5 * vol + 0.0001, t0 + 0.002);
       ng.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
       noise.connect(bp); bp.connect(ng);
       noise.start(t0);
       noise.stop(t0 + dur + 0.01);
+      this._bindEnd(noise, ng);
     } catch (e) { }
   }
 };
