@@ -4,7 +4,18 @@
 (function () {
   "use strict";
 
-  const TOTAL_LEVELS = 4;
+  const TOTAL_LEVELS = 4;        // solo progression cap (levels 0..3)
+  const MP_DEFAULT_MAP = 3;      // "Palace of Fire" — current default map for MP
+  const MP_NEW_ARENA   = 4;      // multi-route deathmatch arena (added by subagent)
+  const MAX_MAP_INDEX  = 4;
+
+  const MAP_OPTIONS = [
+    { idx: 0, name: "SLIPGATE COMPLEX", desc: "small, original starter level" },
+    { idx: 1, name: "THE ARMORY",       desc: "rotunda + 3 alcoves, mid-size" },
+    { idx: 2, name: "DEEP HALLS",       desc: "snaking chambers, mid-size" },
+    { idx: 3, name: "PALACE OF FIRE",   desc: "grand hall, big — current default" },
+    { idx: 4, name: "THE SLAUGHTERHOUSE", desc: "large multi-route arena, catwalks" }
+  ];
 
   // ---------- Renderer / scene / camera ----------
   const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
@@ -160,7 +171,7 @@
       const j = Math.floor(Math.random() * (i + 1));
       const tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
     }
-    const count = Math.min(3 + currentLevelIndex, idx.length); // 3-6 pickups based on level
+    const count = Math.min(1, idx.length); // exactly one rocket spawn per map
     for (let k = 0; k < count; k++) {
       const sp = slots[idx[k]];
       const mesh = makeRocketPickupMesh();
@@ -272,7 +283,21 @@
       getLocalState: getLocalState,
       onRemoteShoot: spawnRemoteShoot,
       onRemoteRocket: spawnRemoteShoot,
-      onRemoteExplosion: spawnRemoteExplosion
+      onRemoteExplosion: spawnRemoteExplosion,
+      onWelcome: (info) => {
+        // First player sees a map-select; subsequent players load whatever the host chose.
+        if (info.isFirst) {
+          showMapSelect(MP_DEFAULT_MAP);
+        } else if (info.map !== null && info.map !== undefined) {
+          loadMpMap(info.map);
+        } else {
+          // Edge case: not first but server hasn't decided yet — wait for mapChange.
+          ui.message("WAITING FOR HOST TO PICK MAP", 0);
+        }
+      },
+      onMapChange: (mapIdx) => {
+        loadMpMap(mapIdx);
+      }
     });
     // Inbound damage from another player.
     network.onHit = (info) => {
@@ -282,13 +307,17 @@
     };
     network.connect();
     multiplayerMode = true;
+    ui.message("CONNECTING...", 0);
+  }
 
-    // PvP locks to the largest map (level 3, "Palace of Fire").
-    // loadLevel handles mob clearing, enemy reset, pickup scatter, and respawn.
-    if (currentLevelIndex !== TOTAL_LEVELS - 1) {
-      loadLevel(TOTAL_LEVELS - 1);
+  // Load an arbitrary map index in PvP mode and (re)lock the pointer.
+  function loadMpMap(mapIdx) {
+    const idx = THREE.MathUtils.clamp(mapIdx | 0, 0, MAX_MAP_INDEX);
+    hideMapSelect();
+    if (currentLevelIndex !== idx) {
+      loadLevel(idx);
     } else {
-      // Already on level 3; just clear mobs and scatter pickups.
+      // Same map - just clear mobs + scatter pickups (no full reload).
       for (let i = 0; i < enemies.length; i++) {
         const m = enemies[i].mesh;
         if (m && m.parent) m.parent.remove(m);
@@ -299,8 +328,60 @@
       ui.setKills(0, 0);
       scatterMpRocketPickups();
     }
-    ui.message("PVP DEATHMATCH — PALACE OF FIRE", 2600);
+    const opt = MAP_OPTIONS[idx];
+    ui.message("PVP DEATHMATCH — " + (opt ? opt.name : "MAP " + idx), 2600);
+    // Acquire pointer if we're not yet locked.
+    if (document.pointerLockElement !== renderer.domElement) {
+      try { renderer.domElement.requestPointerLock(); } catch (_) { /* ignore */ }
+    }
   }
+
+  // ---------- Map-select dialog ----------
+  const mapSelectEl = document.getElementById("map-select");
+  const mapGridEl   = document.getElementById("map-grid");
+  const mapConfirmEl = document.getElementById("map-confirm");
+  let pendingMapChoice = MP_DEFAULT_MAP;
+
+  function buildMapSelectGrid(defaultIdx) {
+    mapGridEl.innerHTML = "";
+    pendingMapChoice = defaultIdx;
+    MAP_OPTIONS.forEach((opt) => {
+      const div = document.createElement("div");
+      div.className = "opt" + (opt.idx === defaultIdx ? " selected" : "");
+      const isDefault = opt.idx === MP_DEFAULT_MAP;
+      div.innerHTML =
+        '<div class="name">' + opt.name + '</div>' +
+        '<div class="desc">' + opt.desc + '</div>' +
+        (isDefault ? '<div class="default-tag">DEFAULT</div>' : '');
+      div.addEventListener("click", () => {
+        pendingMapChoice = opt.idx;
+        Array.from(mapGridEl.children).forEach((c) => c.classList.remove("selected"));
+        div.classList.add("selected");
+      });
+      mapGridEl.appendChild(div);
+    });
+  }
+
+  function showMapSelect(defaultIdx) {
+    buildMapSelectGrid(defaultIdx);
+    mapSelectEl.style.display = "flex";
+  }
+  function hideMapSelect() {
+    mapSelectEl.style.display = "none";
+  }
+
+  mapConfirmEl.addEventListener("click", () => {
+    if (network && network.isConnected()) {
+      network.sendMapChoice(pendingMapChoice);
+      // Server will reply with mapChange, which triggers loadMpMap.
+    } else {
+      // Network failed - fall back to local single-player on the chosen map.
+      hideMapSelect();
+      multiplayerMode = false;
+      loadLevel(pendingMapChoice);
+      try { renderer.domElement.requestPointerLock(); } catch (_) { /* ignore */ }
+    }
+  });
 
   // ---------- Level transitions ----------
   let levelTransitionT = 0;
@@ -318,7 +399,7 @@
       if (m && m.parent) m.parent.remove(m);
     }
 
-    currentLevelIndex = THREE.MathUtils.clamp(index, 0, TOTAL_LEVELS - 1);
+    currentLevelIndex = THREE.MathUtils.clamp(index, 0, MAX_MAP_INDEX);
     level = new Game.Level(scene, currentLevelIndex);
     // PvP mode: don't spawn mobs - it's a deathmatch arena.
     enemies = multiplayerMode ? [] : Game.spawnEnemies(scene, level);
@@ -514,9 +595,13 @@
     if (useNetwork) {
       const url = (document.getElementById("server-url").value || "ws://localhost:8080").trim();
       const name = (document.getElementById("player-name").value || "").trim();
+      // Hide the start overlay; map-select dialog (if first) or loadMpMap will take over.
+      overlay.style.display = "none";
       startMultiplayer(url, name || undefined);
+      // Pointer-lock is acquired in loadMpMap(), AFTER the map is chosen.
+    } else {
+      renderer.domElement.requestPointerLock();
     }
-    renderer.domElement.requestPointerLock();
   }
 
   document.getElementById("btn-solo").addEventListener("click", () => beginGame(false));

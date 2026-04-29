@@ -18,6 +18,10 @@ const MAX_NAME_LEN = 24;
 // Map<id, { id, ws, name, x, y, z, yaw, pitch, weapon, hp, lastSeen }>
 const clients = new Map();
 
+// Currently chosen map index (set by the first client that joins / picks).
+// Reset when the last client disconnects so the next "first" can pick again.
+let currentMapIndex = null;
+
 function makeId() {
   // 6-char base36 random id
   return Math.random().toString(36).slice(2, 8);
@@ -76,14 +80,35 @@ function broadcastExcept(excludeId, obj) {
 function handleHello(client, msg) {
   client.name = clampName(msg && msg.name);
 
-  // Send welcome with current peers (excluding self).
+  // Send welcome with current peers (excluding self) and the active map (or null).
   const peers = [];
   for (const c of clients.values()) {
     if (c.id !== client.id) peers.push(publicState(c));
   }
-  safeSend(client.ws, { type: 'welcome', id: client.id, peers });
+  const isFirst = peers.length === 0 && currentMapIndex === null;
+  safeSend(client.ws, {
+    type: 'welcome',
+    id: client.id,
+    peers,
+    map: currentMapIndex,   // null = no map chosen yet -> client should show map-select
+    isFirst
+  });
 
-  console.log(`[${new Date().toISOString()}] hello id=${client.id} name="${client.name}" peers=${peers.length}`);
+  console.log(`[${new Date().toISOString()}] hello id=${client.id} name="${client.name}" peers=${peers.length} map=${currentMapIndex} first=${isFirst}`);
+}
+
+function handleSetMap(client, msg) {
+  if (!msg) return;
+  const idx = isFiniteNum(msg.map) ? Math.floor(msg.map) : null;
+  if (idx === null || idx < 0 || idx > 4) return;
+  currentMapIndex = idx;
+  console.log(`[${new Date().toISOString()}] setMap by id=${client.id} -> ${idx}`);
+  // Broadcast to everyone (including the picker, so the local load goes through the same path).
+  const payload = { type: 'mapChange', map: idx, by: client.id };
+  for (const c of clients.values()) {
+    if (c.ws.readyState !== c.ws.OPEN) continue;
+    try { c.ws.send(JSON.stringify(payload)); } catch (_) { /* ignore */ }
+  }
 }
 
 function handleState(client, msg) {
@@ -160,6 +185,7 @@ function dispatch(client, msg) {
     case 'rocket': handleRocket(client, msg); break;
     case 'explosion': handleExplosion(client, msg); break;
     case 'hit': handleHit(client, msg); break;
+    case 'setMap': handleSetMap(client, msg); break;
     default: break;
   }
 }
@@ -204,6 +230,11 @@ wss.on('connection', (ws, req) => {
     if (clients.delete(id)) {
       console.log(`[${new Date().toISOString()}] disconnect id=${id} total=${clients.size}`);
       broadcastExcept(id, { type: 'leave', id });
+      // When the last player leaves, clear the map so the next "first" can pick.
+      if (clients.size === 0) {
+        currentMapIndex = null;
+        console.log(`[${new Date().toISOString()}] map cleared (no players)`);
+      }
     }
   });
 

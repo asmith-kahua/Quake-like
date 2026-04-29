@@ -160,6 +160,91 @@
   #overlay button.primary { color: #ffaa44; border-color: #ffaa44; }
   #overlay button.primary:hover { background: #ffaa44; color: #1a0a05; }
 
+  #map-select {
+    position: fixed;
+    inset: 0;
+    background: radial-gradient(ellipse at center, #100804 0%, #000 100%);
+    z-index: 110;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    color: #d8b070;
+    text-align: center;
+    padding: 40px;
+    box-sizing: border-box;
+  }
+  #map-select h1 {
+    font-size: 36px;
+    letter-spacing: 8px;
+    color: #ff8030;
+    margin: 0 0 8px;
+    text-shadow: 2px 2px 0 #000;
+  }
+  #map-select h3 {
+    font-size: 14px;
+    letter-spacing: 3px;
+    margin: 0 0 26px;
+    opacity: 0.7;
+    font-weight: normal;
+  }
+  #map-select .grid {
+    display: grid;
+    grid-template-columns: repeat(3, 220px);
+    gap: 14px;
+    margin-bottom: 22px;
+  }
+  #map-select .opt {
+    background: rgba(40, 22, 12, 0.8);
+    border: 1px solid #6a4828;
+    padding: 18px 14px;
+    cursor: pointer;
+    transition: all 0.15s;
+    pointer-events: auto;
+    font-family: inherit;
+    color: #d8b070;
+  }
+  #map-select .opt:hover {
+    background: rgba(80, 44, 22, 0.95);
+    border-color: #d8b070;
+    color: #ffd590;
+  }
+  #map-select .opt.selected {
+    border-color: #ffaa44;
+    background: rgba(80, 44, 22, 0.95);
+    color: #ffaa44;
+    box-shadow: 0 0 10px rgba(255, 170, 68, 0.4);
+  }
+  #map-select .opt .name {
+    font-size: 16px;
+    letter-spacing: 4px;
+    margin-bottom: 6px;
+  }
+  #map-select .opt .desc {
+    font-size: 11px;
+    letter-spacing: 1px;
+    opacity: 0.7;
+    line-height: 1.4;
+  }
+  #map-select .default-tag {
+    color: #ffaa44;
+    font-size: 10px;
+    letter-spacing: 2px;
+    margin-top: 6px;
+  }
+  #map-select button.confirm {
+    background: rgba(40, 22, 12, 0.8);
+    color: #ffaa44;
+    border: 1px solid #ffaa44;
+    padding: 12px 26px;
+    font-family: inherit;
+    font-size: 14px;
+    letter-spacing: 5px;
+    cursor: pointer;
+    pointer-events: auto;
+  }
+  #map-select button.confirm:hover { background: #ffaa44; color: #1a0a05; }
+
   #damage-flash {
     position: fixed;
     inset: 0;
@@ -199,6 +284,13 @@
 
 <div id="damage-flash"></div>
 <div id="pickup-flash"></div>
+
+<div id="map-select">
+  <h1>SELECT MAP</h1>
+  <h3>YOU ARE THE HOST — PICK THE ARENA</h3>
+  <div class="grid" id="map-grid"></div>
+  <button class="confirm" id="map-confirm">START MATCH</button>
+</div>
 
 <div id="overlay">
   <h1>QUAKE-LIKE</h1>

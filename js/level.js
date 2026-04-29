@@ -11,7 +11,7 @@
 //   level.resolveAABBAxis(box, axis) : scalar push-out along one axis
 //   level.raycastWalls(o,d,maxDist) : { point, distance, normal, mesh } | null
 //
-//   level.levelIndex        : 0..3
+//   level.levelIndex        : 0..4
 //   level.levelName         : string
 //   level.exitTrigger       : THREE.Box3   - step here to advance
 //   level.exitMesh          : THREE.Mesh   - emissive cyan slab visible at trigger
@@ -28,7 +28,7 @@ window.Game.Level = class
     this.scene = scene;
     this.levelIndex = (levelIndex | 0);
     if (this.levelIndex < 0) this.levelIndex = 0;
-    if (this.levelIndex > 3) this.levelIndex = 3;
+    if (this.levelIndex > 4) this.levelIndex = 4;
 
     // Public collections
     this.colliders = [];
@@ -67,6 +67,7 @@ window.Game.Level = class
       case 1: this._buildLevel1(); break;
       case 2: this._buildLevel2(); break;
       case 3: this._buildLevel3(); break;
+      case 4: this._buildLevel4(); break;
     }
 
     // Compute overall bounds from the colliders.
@@ -159,6 +160,22 @@ window.Game.Level = class
         ambient: 0x352018,
         hemiSky: 0x60281a,
         hemiGround: 0x1a0a06,
+      },
+      // 4: THE SLAUGHTERHOUSE - dark steel with rust-red trim
+      {
+        wall:  [[58, 56, 60],  [28, 26, 30]],
+        floor: [[72, 70, 76],  [38, 36, 40]],
+        trim:  [[78, 38, 28],  [40, 18, 12]],
+        ceil:  [[34, 32, 36],  [16, 16, 18]],
+        wallTint:  0x8090a0,
+        floorTint: 0x9098a4,
+        ceilTint:  0x484850,
+        trimTint:  0xa05030,
+        torchColor: 0xff6644,
+        torchEmissive: 0xff9966,
+        ambient: 0x2a2428,
+        hemiSky: 0x404858,
+        hemiGround: 0x14100e,
       },
     ];
     return palettes[idx];
@@ -1334,6 +1351,339 @@ window.Game.Level = class
     // South wall: doorway 6 wide at x=0 (matches grand hall north doorway)
     this._wallXWithDoor(g, minX, maxX, minZ, h, 0, 6, 3.5);
     this._wallX(g, cx, 0, maxZ, sx, h);
+    this._wallZ(g, minX, 0, cz, sz, h);
+    this._wallZ(g, maxX, 0, cz, sz, h);
+  }
+
+  // ===========================================================================
+  // LEVEL 4 - THE SLAUGHTERHOUSE
+  // 60x60 multi-route deathmatch arena. Central courtyard with cover, ramps,
+  // catwalks at y=4 forming an L over the NE half, an RJ-only perch at y=7
+  // over center. Three wings (West, East, North) connect to the courtyard
+  // via dedicated doorways AND via two flanking corridors that link wings
+  // to North directly (so a defender at the north door can be flanked).
+  // ===========================================================================
+  _buildLevel4()
+  {
+    this.levelName = 'THE SLAUGHTERHOUSE';
+
+    // Layout (top-down). All floors at y=0 except the East-wing pit-rim platforms.
+    //   Courtyard         : x[-10,10],  z[-10,10],  h=10  (20x20, the open centre)
+    //   West wing         : x[-25,-10], z[-8,8],    h=5   (15x16)
+    //   East wing (pit)   : x[10,25],   z[-8,8],    h=5   (15x16) — has y=1 raised border platforms
+    //   North wing        : x[-15,15],  z[10,28],   h=5   (30x18)  EXIT here
+    //   W->Courtyard door : x=-10, z=0, 4 wide
+    //   E->Courtyard door : x=+10, z=0, 4 wide
+    //   N->Courtyard door : x=0, z=10, 4 wide
+    //   W->N flank corr   : x[-13.5,-10.5], z[8,10], 3 wide x 2 long, h=4
+    //   E->N flank corr   : x[10.5,13.5],   z[8,10], 3 wide x 2 long, h=4
+    //
+    // Courtyard verticality:
+    //   - Catwalk L at y=4 (0.4 thick platforms): along inner E wall and inner N wall.
+    //   - 2 staircases (4 steps of 1u) climbing from courtyard floor to catwalks.
+    //   - RJ-only perch at y=7 over centre (2x2, gap of 3u from catwalk top — un-jumpable).
+    //   - 4 cover obstacles in the courtyard.
+
+    this._buildL4_Courtyard();
+    this._buildL4_WestWing();
+    this._buildL4_EastWing();
+    this._buildL4_NorthWing();
+    this._buildL4_FlankCorrWN();
+    this._buildL4_FlankCorrEN();
+
+    // Lighting (12 torches; cap is ~14)
+    this._addLighting([
+      // Courtyard - bright, varied heights
+      { p: new THREE.Vector3(-7,  6.2, -7),  intensity: 1.2, range: 16 },
+      { p: new THREE.Vector3( 7,  6.2,  7),  intensity: 1.2, range: 16 },
+      { p: new THREE.Vector3( 7,  6.2, -7),  intensity: 1.0, range: 14 },
+      { p: new THREE.Vector3(-7,  6.2,  7),  intensity: 1.0, range: 14 },
+      { p: new THREE.Vector3( 0,  8.4,  0),  intensity: 1.0, range: 14 },
+      // West wing
+      { p: new THREE.Vector3(-22, 3.6, -5),  intensity: 1.0 },
+      { p: new THREE.Vector3(-22, 3.6,  5),  intensity: 1.0 },
+      // East wing (pit)
+      { p: new THREE.Vector3( 22, 3.6, -5),  intensity: 1.0 },
+      { p: new THREE.Vector3( 22, 3.6,  5),  intensity: 1.0 },
+      // North wing
+      { p: new THREE.Vector3(-9,  3.6, 18),  intensity: 1.1 },
+      { p: new THREE.Vector3( 9,  3.6, 18),  intensity: 1.1 },
+      { p: new THREE.Vector3( 0,  3.6, 25),  intensity: 1.0 },
+    ]);
+
+    // Spawn near south edge of the courtyard, eye height
+    this.spawnPoint = new THREE.Vector3(0, 1.7, -7);
+
+    // 10 enemy / DM spawn points distributed across all 4 main areas.
+    // Verified clear of: courtyard pillars at (-5,-5)/(5,5), low walls at (-5,5)/(5,-5),
+    // east-wing border platforms x[14..23] z[-7..-5]/z[5..7]/x[20..23] z[-5..5],
+    // and stair blocks. All on floor at y=1.0.
+    this.enemySpawns = [
+      // Courtyard
+      new THREE.Vector3( 0,  1.0, -7),   // south centre
+      new THREE.Vector3( 0,  1.0,  4),   // north of centre, off cover
+      new THREE.Vector3(-7,  1.0,  0),   // west edge
+      // West wing
+      new THREE.Vector3(-22, 1.0, -5),
+      new THREE.Vector3(-22, 1.0,  5),
+      new THREE.Vector3(-15, 1.0,  0),   // near east doorway
+      // East wing (pit interior — clear of border platforms)
+      new THREE.Vector3( 12, 1.0,  0),   // pit floor west side
+      new THREE.Vector3( 17, 1.0,  0),   // pit floor centre
+      // North wing
+      new THREE.Vector3(-10, 1.0, 14),
+      new THREE.Vector3( 10, 1.0, 22),
+    ];
+
+    // 6 health crystals — at least one per wing, one in courtyard, two on catwalks
+    this._placeHealthCrystal(-22,   0);   // West wing centre
+    this._placeHealthCrystal( 17,   0);   // East wing pit interior
+    this._placeHealthCrystal(  0,  20);   // North wing centre
+    this._placeHealthCrystal( -7,  -7);   // Courtyard SW (near cover)
+    // Two on catwalks (manual y override after place)
+    this._placeHealthCrystal(  6,   8.5); // North catwalk (east end)
+    this.healthPickups[this.healthPickups.length - 1].mesh.position.y = 4.7;
+    this.healthPickups[this.healthPickups.length - 1].position.y       = 4.7;
+    this._placeHealthCrystal(  8.5,  6);  // East catwalk (north end)
+    this.healthPickups[this.healthPickups.length - 1].mesh.position.y = 4.7;
+    this.healthPickups[this.healthPickups.length - 1].position.y       = 4.7;
+
+    // Rocket pickup in centre of courtyard — visible from all entry doors
+    this._placeRocketPickup(0, 0);
+
+    // Exit pad in the north wing (back wall area) — MP-only in practice but
+    // keeps solo mode functional if this map is loaded from the menu.
+    this._placeExitPad(0, 26);
+  }
+
+  _buildL4_Courtyard()
+  {
+    const g = new THREE.Group();
+    g.name = 'L4_Courtyard';
+    this.root.add(g);
+
+    const minX = -10, maxX = 10;
+    const minZ = -10, maxZ = 10;
+    const cx = 0, cz = 0;
+    const sx = 20, sz = 20;
+    const h  = 10;
+
+    this._addFloor(g, cx, cz, sx, sz);
+    this._addCeiling(g, cx, h, cz, sx, sz);
+
+    // Walls with doorways. Door height kept BELOW catwalk underside (catwalk at y=4 t=0.4 -> bottom=3.8).
+    // West wall: doorway 4 wide at z=0 -> west wing
+    this._wallZWithDoor(g, minX, minZ, maxZ, h, 0, 4, 3.5);
+    // East wall: doorway 4 wide at z=0 -> east wing
+    this._wallZWithDoor(g, maxX, minZ, maxZ, h, 0, 4, 3.5);
+    // North wall: doorway 4 wide at x=0 -> north wing
+    this._wallXWithDoor(g, minX, maxX, maxZ, h, 0, 4, 3.5);
+    // South wall: closed
+    this._wallX(g, cx, 0, minZ, sx, h);
+
+    // ---- Cover obstacles in the courtyard ----
+    // Two tall pillars (diagonal pair)
+    this._addBox(g, -5, 2.0, -5, 1.4, 4.0, 1.4, this._materials.trim, true);
+    this._addBox(g,  5, 2.0,  5, 1.4, 4.0, 1.4, this._materials.trim, true);
+    this._addBox(g, -5, 4.0 - 0.15, -5, 1.6, 0.3, 1.6, this._materials.wall, false);
+    this._addBox(g,  5, 4.0 - 0.15,  5, 1.6, 0.3, 1.6, this._materials.wall, false);
+    // Two low walls (other diagonal pair) — cover blocks player can shoot over by jumping
+    this._addBox(g,  5, 0.6, -5, 3.0, 1.2, 0.8, this._materials.trim, true);
+    this._addBox(g, -5, 0.6,  5, 0.8, 1.2, 3.0, this._materials.trim, true);
+
+    // ---- Catwalks at y=4, t=0.4 (top at 4.2, bottom at 3.8) ----
+    // East catwalk: along inner east wall, runs along z[-2..9.5]
+    this._addBox(g, 8.5, 4.0, 3.75, 1.5, 0.4, 11.5, this._materials.trim, true);
+    // North catwalk: along inner north wall, runs along x[-2..7.5]
+    // (joins the east catwalk near NE corner)
+    this._addBox(g, 2.75, 4.0, 8.5, 9.5, 0.4, 1.5, this._materials.trim, true);
+    // Catwalk railings (low decorative trim — also collide so players don't roll off)
+    // East catwalk inner edge (toward courtyard centre at x=7.75)
+    this._addBox(g, 7.75, 4.6, 3.75, 0.2, 0.8, 11.5, this._materials.trim, true);
+    // North catwalk inner edge (toward courtyard centre at z=7.75)
+    this._addBox(g, 2.75, 4.6, 7.75, 9.5, 0.8, 0.2, this._materials.trim, true);
+
+    // ---- Staircase ramp 1: SE area, climbs in -z to land on east catwalk ----
+    // Steps 2u wide (x[7.5..9.5]) at increasing y. Top step lands at z=-2 y=4.
+    // Each step 1u tall, 1.2u deep along z. Solid blocks (cy=sy/2 means top at sy).
+    this._addBox(g, 8.5, 0.5, -6.4, 2.0, 1.0, 1.2, this._materials.trim, true); // y top 1
+    this._addBox(g, 8.5, 1.0, -5.2, 2.0, 2.0, 1.2, this._materials.trim, true); // y top 2
+    this._addBox(g, 8.5, 1.5, -4.0, 2.0, 3.0, 1.2, this._materials.trim, true); // y top 3
+    this._addBox(g, 8.5, 2.0, -2.8, 2.0, 4.0, 1.2, this._materials.trim, true); // y top 4
+
+    // ---- Staircase ramp 2: NW area, climbs in +x to land on north catwalk ----
+    // Steps 2u deep (z[7.5..9.5]) at increasing y. Top step lands at x=-2 y=4.
+    this._addBox(g, -6.4, 0.5, 8.5, 1.2, 1.0, 2.0, this._materials.trim, true); // y top 1
+    this._addBox(g, -5.2, 1.0, 8.5, 1.2, 2.0, 2.0, this._materials.trim, true); // y top 2
+    this._addBox(g, -4.0, 1.5, 8.5, 1.2, 3.0, 2.0, this._materials.trim, true); // y top 3
+    this._addBox(g, -2.8, 2.0, 8.5, 1.2, 4.0, 2.0, this._materials.trim, true); // y top 4
+
+    // ---- RJ-only perch at y=7 over courtyard centre ----
+    // 2x2x0.4 platform (top at y=7.2). Catwalk top at 4.2, so a 3u vertical
+    // gap — unreachable by player jump (max ~1.3u). Requires rocket-jump.
+    this._addBox(g, 0, 7.0, 0, 2.0, 0.4, 2.0, this._materials.trim, true);
+    // Small emissive marker on the perch so players can see it from below
+    this._addBox(g, 0, 7.3, 0, 0.4, 0.1, 0.4, this._materials.exitEmissive, false);
+  }
+
+  _buildL4_WestWing()
+  {
+    const g = new THREE.Group();
+    g.name = 'L4_WestWing';
+    this.root.add(g);
+
+    const minX = -25, maxX = -10;
+    const minZ = -8, maxZ = 8;
+    const cx = -17.5, cz = 0;
+    const sx = 15, sz = 16;
+    const h  = 5;
+
+    this._addFloor(g, cx, cz, sx, sz);
+    this._addCeiling(g, cx, h, cz, sx, sz);
+
+    // West wall: closed
+    this._wallZ(g, minX, 0, cz, sz, h);
+    // East wall: NOT built here — the courtyard's west wall (with its doorway)
+    // serves as the shared boundary at x=-10. Avoids double-walls.
+    // South wall: closed
+    this._wallX(g, cx, 0, minZ, sx, h);
+    // North wall: doorway 3 wide at x=-12 (-> W->N flank corridor at x[-13.5..-10.5])
+    this._wallXWithDoor(g, minX, maxX, maxZ, h, -12, 3, 3.0);
+
+    // A pair of cover crates / pillars in the wing
+    this._addBox(g, -20, 0.6,  3, 1.2, 1.2, 1.2, this._materials.trim, true);
+    this._addBox(g, -20, 0.6, -3, 1.2, 1.2, 1.2, this._materials.trim, true);
+    // Tall narrow pillar near doorway choke
+    this._addBox(g, -14, 1.5,  0, 0.8, 3.0, 0.8, this._materials.trim, true);
+  }
+
+  _buildL4_EastWing()
+  {
+    const g = new THREE.Group();
+    g.name = 'L4_EastWing';
+    this.root.add(g);
+
+    const minX = 10, maxX = 25;
+    const minZ = -8, maxZ = 8;
+    const cx = 17.5, cz = 0;
+    const sx = 15, sz = 16;
+    const h  = 5;
+
+    this._addFloor(g, cx, cz, sx, sz);
+    this._addCeiling(g, cx, h, cz, sx, sz);
+
+    // West wall: NOT built here — the courtyard's east wall (with its doorway)
+    // serves as the shared boundary at x=10. Avoids double-walls.
+    // East wall: closed
+    this._wallZ(g, maxX, 0, cz, sz, h);
+    // South wall: closed
+    this._wallX(g, cx, 0, minZ, sx, h);
+    // North wall: doorway 3 wide at x=12 (-> E->N flank corridor at x[10.5..13.5])
+    this._wallXWithDoor(g, minX, maxX, maxZ, h, 12, 3, 3.0);
+
+    // ---- The PIT ----
+    // The wing has raised border platforms at y=1 framing a "pit" interior at y=0.
+    // Player crosses from the courtyard at y=0 directly INTO the pit; the surrounding
+    // ledges are the visually higher rim. To get out (or move through the wing) the
+    // player jumps up to a 1u-high platform — a clean step-down feel without breaking
+    // the player.js y<1.7 safety clamp.
+    //
+    // Pit interior (no collider, just default y=0 floor): x[14..20] z[-5..5]
+    // Border platforms (collidable, y[0..1]):
+
+    // North border platform: x[10..23] z[5..7] (extends to wing west wall)
+    this._addBox(g, 16.5, 0.5,  6, 13.0, 1.0, 2.0, this._materials.trim, true);
+    // South border platform: x[10..23] z[-7..-5]
+    this._addBox(g, 16.5, 0.5, -6, 13.0, 1.0, 2.0, this._materials.trim, true);
+    // East border platform: x[20..23] z[-5..5]
+    this._addBox(g, 21.5, 0.5,  0, 3.0, 1.0, 10.0, this._materials.trim, true);
+
+    // The pit interior x[10..20] z[-5..5] sits at y=0 — the same global level as
+    // the courtyard. Surrounded on 3 sides by 1u-tall border platforms, so it
+    // visually reads as a pit while preserving the y<1.7 player safety clamp.
+    // Players step down INTO the pit by entering through the courtyard doorway
+    // at z=0 (the entry strip x[10..14] z[-2..2] is uncovered). Players climb
+    // OUT of the pit by jumping (1u step is jumpable).
+  }
+
+  _buildL4_NorthWing()
+  {
+    const g = new THREE.Group();
+    g.name = 'L4_NorthWing';
+    this.root.add(g);
+
+    const minX = -15, maxX = 15;
+    const minZ = 10, maxZ = 28;
+    const cx = 0, cz = 19;
+    const sx = 30, sz = 18;
+    const h  = 5;
+
+    this._addFloor(g, cx, cz, sx, sz);
+    this._addCeiling(g, cx, h, cz, sx, sz);
+
+    // South wall: the courtyard's north wall (z=10) already covers x[-10..10] with
+    // a door at x=0. The north wing only needs to build the wall segments OUTSIDE
+    // x[-10..10] (i.e. above the flank corridors), each with their own doorway.
+    //
+    //   West outer segment: x[-15..-10] with door at x=-12 (3 wide -> W->N flank)
+    //   East outer segment: x[10..15]   with door at x=12  (3 wide -> E->N flank)
+    {
+      const z = minZ;
+      this._wallXWithDoor(g, -15, -10, z, h, -12, 3, 3.0);
+      this._wallXWithDoor(g,  10,  15, z, h,  12, 3, 3.0);
+    }
+    // North/East/West walls closed
+    this._wallX(g, cx, 0, maxZ, sx, h);
+    this._wallZ(g, minX, 0, cz, sz, h);
+    this._wallZ(g, maxX, 0, cz, sz, h);
+
+    // Cover obstacles inside the north wing
+    this._addBox(g, -8, 1.0, 14, 1.2, 2.0, 1.2, this._materials.trim, true);
+    this._addBox(g,  8, 1.0, 14, 1.2, 2.0, 1.2, this._materials.trim, true);
+    this._addBox(g,  0, 0.6, 16, 4.0, 1.2, 1.0, this._materials.trim, true);
+    // A pair of cover blocks near the back wall, framing the exit
+    this._addBox(g, -4, 0.6, 25, 1.2, 1.2, 1.2, this._materials.trim, true);
+    this._addBox(g,  4, 0.6, 25, 1.2, 1.2, 1.2, this._materials.trim, true);
+  }
+
+  _buildL4_FlankCorrWN()
+  {
+    const g = new THREE.Group();
+    g.name = 'L4_FlankCorrWN';
+    this.root.add(g);
+
+    // Connects west wing's north door at x=-12 (x[-13.5..-10.5]) to
+    // north wing's south door at x=-12 (same x range), via 2u of z.
+    const minX = -13.5, maxX = -10.5;
+    const minZ = 8, maxZ = 10;
+    const cx = -12, cz = 9;
+    const sx = 3, sz = 2;
+    const h  = 4;
+
+    this._addFloor(g, cx, cz, sx, sz);
+    this._addCeiling(g, cx, h, cz, sx, sz);
+    // East and west walls of the corridor
+    this._wallZ(g, minX, 0, cz, sz, h);
+    this._wallZ(g, maxX, 0, cz, sz, h);
+    // North and south are open (matching doorways in the rooms it connects).
+  }
+
+  _buildL4_FlankCorrEN()
+  {
+    const g = new THREE.Group();
+    g.name = 'L4_FlankCorrEN';
+    this.root.add(g);
+
+    // Connects east wing's north door at x=12 (x[10.5..13.5]) to
+    // north wing's south door at x=12 (same x range), via 2u of z.
+    const minX = 10.5, maxX = 13.5;
+    const minZ = 8, maxZ = 10;
+    const cx = 12, cz = 9;
+    const sx = 3, sz = 2;
+    const h  = 4;
+
+    this._addFloor(g, cx, cz, sx, sz);
+    this._addCeiling(g, cx, h, cz, sx, sz);
     this._wallZ(g, minX, 0, cz, sz, h);
     this._wallZ(g, maxX, 0, cz, sz, h);
   }

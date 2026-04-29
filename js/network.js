@@ -152,6 +152,9 @@
       this.onRemoteShoot = typeof opts.onRemoteShoot === 'function' ? opts.onRemoteShoot : null;
       this.onRemoteRocket = typeof opts.onRemoteRocket === 'function' ? opts.onRemoteRocket : null;
       this.onRemoteExplosion = typeof opts.onRemoteExplosion === 'function' ? opts.onRemoteExplosion : null;
+      // Map-select hooks
+      this.onWelcome = typeof opts.onWelcome === 'function' ? opts.onWelcome : null;     // ({map, isFirst, peers}) - server's initial response
+      this.onMapChange = typeof opts.onMapChange === 'function' ? opts.onMapChange : null; // (mapIdx) - someone (incl. us) chose a map
 
       this.ws = null;
       this.connected = false;
@@ -345,6 +348,19 @@
               this._ensureRemote(msg.peers[i]);
             }
           }
+          this.serverMap = isFiniteNum(msg.map) ? Math.floor(msg.map) : null;
+          this.isFirstPlayer = !!msg.isFirst;
+          if (this.onWelcome) {
+            this.onWelcome({ map: this.serverMap, isFirst: this.isFirstPlayer, peers: msg.peers || [] });
+          }
+          break;
+
+        case 'mapChange':
+          if (isFiniteNum(msg.map)) {
+            const m = Math.floor(msg.map);
+            this.serverMap = m;
+            if (this.onMapChange) this.onMapChange(m, msg.by || null);
+          }
           break;
 
         case 'peers':
@@ -516,6 +532,15 @@
           targetId: targetId,
           dmg: isFiniteNum(dmg) ? dmg : 0
         }));
+      } catch (_) { /* ignore */ }
+    }
+
+    // First player picks a map index; server stores it and broadcasts mapChange to everyone.
+    sendMapChoice(mapIdx) {
+      if (!this.connected || !this.ws || this.ws.readyState !== 1) return;
+      if (!isFiniteNum(mapIdx)) return;
+      try {
+        this.ws.send(JSON.stringify({ type: 'setMap', map: Math.floor(mapIdx) }));
       } catch (_) { /* ignore */ }
     }
   };
