@@ -270,6 +270,28 @@ window.Game.Weapon = class
       this._lightPool.push({ light: l, inUse: false });
     }
 
+    // ---- Pooled rocket / grenade projectile groups -----------------------
+    // Each fire used to allocate fresh CylinderGeometry + ConeGeometry +
+    // PlaneGeometry + materials (rocket) or SphereGeometry + PlaneGeometry +
+    // materials (grenade). Even at the modest fire rates the user can rack up
+    // dozens per minute in a long fight, churning GPU buffers and JS GC.
+    // Pre-allocate a small pool of fully-formed projectile groups; pool slot
+    // count is conservative enough to cover worst-case in-flight projectiles
+    // (rocket: maxRange/speed = 100/25 = 4s, fireRate 0.7s -> ~6 in flight;
+    // grenade: maxLifetime 4s, fireRate 0.85s -> ~5 in flight).
+    this._rocketProjectilePoolSize = 6;
+    this._rocketProjectilePool = [];
+    for (let i = 0; i < this._rocketProjectilePoolSize; i++)
+    {
+      this._rocketProjectilePool.push(this._buildRocketProjectileGroup());
+    }
+    this._grenadeProjectilePoolSize = 6;
+    this._grenadeProjectilePool = [];
+    for (let i = 0; i < this._grenadeProjectilePoolSize; i++)
+    {
+      this._grenadeProjectilePool.push(this._buildGrenadeProjectileGroup());
+    }
+
     // ---- Build viewmodels (parented to camera) ---------------------------
     // Rifle viewmodel
     this.rifleView = new THREE.Group();
@@ -1249,6 +1271,132 @@ window.Game.Weapon = class
     return null;
   }
 
+  // ---- Rocket / grenade projectile pool helpers ----------------------------
+  // Each builder constructs a fully-formed projectile group whose geometries
+  // and materials are owned by the pool slot — they are NEVER disposed during
+  // gameplay (only on level dispose, but the Weapon outlives Level swaps so
+  // we just hide+reuse). Slots track inUse; acquire flips visible on, release
+  // removes from scene parent and flips visible off.
+  _buildRocketProjectileGroup()
+  {
+    const group = new THREE.Group();
+    group.userData.isProjectile = true;
+
+    const bodyGeom = new THREE.CylinderGeometry(0.07, 0.07, 0.28, 10);
+    const bodyMat  = new THREE.MeshBasicMaterial({ color: 0x222226 });
+    const body     = new THREE.Mesh(bodyGeom, bodyMat);
+    body.rotation.x = Math.PI / 2;
+    body.userData.isProjectile = true;
+    group.add(body);
+
+    const tipGeom = new THREE.ConeGeometry(0.07, 0.16, 10);
+    const tipMat  = new THREE.MeshBasicMaterial({ color: 0xff7822, emissive: 0xff5500 });
+    const tip = new THREE.Mesh(tipGeom, tipMat);
+    tip.rotation.x = Math.PI / 2;
+    tip.position.z = -0.20;
+    tip.userData.isProjectile = true;
+    group.add(tip);
+
+    const flameGeom = new THREE.PlaneGeometry(0.25, 0.25);
+    const flameMat  = new THREE.MeshBasicMaterial({
+      map: this._flashTexture,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthTest: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const flame = new THREE.Mesh(flameGeom, flameMat);
+    flame.position.z = 0.18;
+    flame.userData.isProjectile = true;
+    group.add(flame);
+
+    group.visible = false;
+    return { group, body, tip, flame, inUse: false };
+  }
+
+  _buildGrenadeProjectileGroup()
+  {
+    const group = new THREE.Group();
+    group.userData.isProjectile = true;
+
+    const bodyGeom = new THREE.SphereGeometry(0.10, 14, 10);
+    const bodyMat  = new THREE.MeshBasicMaterial({ color: 0x55ff66 });
+    const body     = new THREE.Mesh(bodyGeom, bodyMat);
+    body.userData.isProjectile = true;
+    group.add(body);
+
+    const haloGeom = new THREE.PlaneGeometry(0.36, 0.36);
+    const haloMat  = new THREE.MeshBasicMaterial({
+      map: this._sparkTexture,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthTest: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      color: 0x66ff88,
+      opacity: 0.85,
+    });
+    const halo = new THREE.Mesh(haloGeom, haloMat);
+    halo.userData.isProjectile = true;
+    group.add(halo);
+
+    group.visible = false;
+    return { group, body, halo, inUse: false };
+  }
+
+  _acquireRocketProjectile()
+  {
+    for (let i = 0; i < this._rocketProjectilePool.length; i++)
+    {
+      const slot = this._rocketProjectilePool[i];
+      if (!slot.inUse)
+      {
+        slot.inUse = true;
+        slot.group.visible = true;
+        return slot;
+      }
+    }
+    return null;
+  }
+
+  _releaseRocketProjectile(slot)
+  {
+    if (!slot) return;
+    if (slot.group && slot.group.parent)
+    {
+      slot.group.parent.remove(slot.group);
+    }
+    if (slot.group) slot.group.visible = false;
+    slot.inUse = false;
+  }
+
+  _acquireGrenadeProjectile()
+  {
+    for (let i = 0; i < this._grenadeProjectilePool.length; i++)
+    {
+      const slot = this._grenadeProjectilePool[i];
+      if (!slot.inUse)
+      {
+        slot.inUse = true;
+        slot.group.visible = true;
+        return slot;
+      }
+    }
+    return null;
+  }
+
+  _releaseGrenadeProjectile(slot)
+  {
+    if (!slot) return;
+    if (slot.group && slot.group.parent)
+    {
+      slot.group.parent.remove(slot.group);
+    }
+    if (slot.group) slot.group.visible = false;
+    slot.inUse = false;
+  }
+
   _releaseLight(slot)
   {
     if (!slot) return;
@@ -1422,6 +1570,12 @@ window.Game.Weapon = class
   {
     if (this.rocket.ammo <= 0) return;
 
+    // Acquire a projectile slot from the pool. If saturated, drop the shot
+    // (better than ballooning the pool — this only fires when 6+ rockets are
+    // already mid-flight, which is well past visual chaos).
+    const slot = this._acquireRocketProjectile();
+    if (!slot) return;
+
     this.rocket.fireTimer = this.rocket.fireRate;
     this.rocket.ammo--;
 
@@ -1432,52 +1586,18 @@ window.Game.Weapon = class
     // Direction: camera forward.
     const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion).normalize();
 
-    // Build projectile mesh - tiny cylinder with a cone tip.
-    const projGroup = new THREE.Group();
-
-    const bodyGeom = new THREE.CylinderGeometry(0.07, 0.07, 0.28, 10);
-    const bodyMat  = new THREE.MeshBasicMaterial({ color: 0x222226 });
-    const body     = new THREE.Mesh(bodyGeom, bodyMat);
-    // Cylinder is along Y by default; we'll orient the group along world dir below.
-    body.rotation.x = Math.PI / 2;
-    projGroup.add(body);
-
-    const tipGeom = new THREE.ConeGeometry(0.07, 0.16, 10);
-    const tipMat  = new THREE.MeshBasicMaterial({ color: 0xff7822, emissive: 0xff5500 });
-    // MeshBasicMaterial doesn't really do emissive, but we keep colour bright.
-    const tip = new THREE.Mesh(tipGeom, tipMat);
-    tip.rotation.x = Math.PI / 2;
-    tip.position.z = -0.20;
-    projGroup.add(tip);
-
-    // Glow plug at the back (visual flame)
-    const flameGeom = new THREE.PlaneGeometry(0.25, 0.25);
-    const flameMat  = new THREE.MeshBasicMaterial({
-      map: this._flashTexture,
-      transparent: true,
-      blending: THREE.AdditiveBlending,
-      depthTest: true,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-    });
-    const flame = new THREE.Mesh(flameGeom, flameMat);
-    flame.position.z = 0.18;
-    projGroup.add(flame);
-
+    const projGroup = slot.group;
     projGroup.position.copy(spawn);
     // Orient: look along dir (lookAt point ahead of spawn).
     projGroup.lookAt(spawn.clone().add(dir));
-    projGroup.userData.isProjectile = true;
-    projGroup.traverse((m) =>
-    {
-      if (m.isMesh) m.userData.isProjectile = true;
-    });
+    // userData.isProjectile is set in the builder; no need to re-traverse.
 
     this.scene.add(projGroup);
 
     this.rockets.push({
+      slot: slot,
       mesh: projGroup,
-      flame: flame,
+      flame: slot.flame,
       pos: spawn.clone(),
       prevPos: spawn.clone(),
       dir: dir.clone(),
@@ -1504,16 +1624,11 @@ window.Game.Weapon = class
       const r = this.rockets[i];
       if (!r.alive)
       {
-        // dispose
-        if (r.mesh && r.mesh.parent) r.mesh.parent.remove(r.mesh);
-        r.mesh && r.mesh.traverse && r.mesh.traverse((m) =>
-        {
-          if (m.isMesh)
-          {
-            if (m.material && m.material.dispose) m.material.dispose();
-            if (m.geometry && m.geometry.dispose) m.geometry.dispose();
-          }
-        });
+        // Return projectile mesh to the pool. Pool slots own their geom/material
+        // and are reused for the lifetime of the Weapon — never disposed here.
+        this._releaseRocketProjectile(r.slot);
+        r.slot = null;
+        r.mesh = null;
         this.rockets.splice(i, 1);
         continue;
       }
@@ -2121,6 +2236,10 @@ window.Game.Weapon = class
   {
     if (this.grenade.ammo <= 0) return;
 
+    // Acquire a projectile slot from the pool. If saturated, drop the shot.
+    const slot = this._acquireGrenadeProjectile();
+    if (!slot) return;
+
     this.grenade.fireTimer = this.grenade.fireRate;
     this.grenade.ammo--;
 
@@ -2131,41 +2250,17 @@ window.Game.Weapon = class
     // Direction: camera forward.
     const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion).normalize();
 
-    // Build the projectile mesh - green glowing sphere.
-    const projGroup = new THREE.Group();
-
-    const bodyGeom = new THREE.SphereGeometry(0.10, 14, 10);
-    const bodyMat  = new THREE.MeshBasicMaterial({ color: 0x55ff66 });
-    const body     = new THREE.Mesh(bodyGeom, bodyMat);
-    projGroup.add(body);
-
-    // Outer glow halo (camera-facing plane)
-    const haloGeom = new THREE.PlaneGeometry(0.36, 0.36);
-    const haloMat  = new THREE.MeshBasicMaterial({
-      map: this._sparkTexture,
-      transparent: true,
-      blending: THREE.AdditiveBlending,
-      depthTest: true,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-      color: 0x66ff88,
-      opacity: 0.85,
-    });
-    const halo = new THREE.Mesh(haloGeom, haloMat);
-    projGroup.add(halo);
-
+    const projGroup = slot.group;
     projGroup.position.copy(spawn);
-    projGroup.userData.isProjectile = true;
-    projGroup.traverse((m) =>
-    {
-      if (m.isMesh) m.userData.isProjectile = true;
-    });
+    projGroup.rotation.set(0, 0, 0);
+    // userData.isProjectile is set in the builder; no need to re-traverse.
 
     this.scene.add(projGroup);
 
     this.grenades.push({
+      slot: slot,
       mesh: projGroup,
-      halo: halo,
+      halo: slot.halo,
       pos: spawn.clone(),
       prevPos: spawn.clone(),
       vel: dir.clone().multiplyScalar(this.grenade.projectileSpeed),
@@ -2194,16 +2289,11 @@ window.Game.Weapon = class
       const g = this.grenades[i];
       if (!g.alive)
       {
-        // dispose
-        if (g.mesh && g.mesh.parent) g.mesh.parent.remove(g.mesh);
-        g.mesh && g.mesh.traverse && g.mesh.traverse((m) =>
-        {
-          if (m.isMesh)
-          {
-            if (m.material && m.material.dispose) m.material.dispose();
-            if (m.geometry && m.geometry.dispose) m.geometry.dispose();
-          }
-        });
+        // Return projectile mesh to the pool. Pool slots own their geom/material
+        // and are reused for the lifetime of the Weapon — never disposed here.
+        this._releaseGrenadeProjectile(g.slot);
+        g.slot = null;
+        g.mesh = null;
         this.grenades.splice(i, 1);
         continue;
       }
@@ -2369,6 +2459,56 @@ window.Game.Weapon = class
   // -------------------------------------------------------------------------
   // Misc helpers
   // -------------------------------------------------------------------------
+
+  // Release every in-flight rocket and grenade back to its pool slot. Called
+  // by main.js loadLevel() so map swaps don't leave projectiles dangling
+  // (and don't leak per-projectile materials/geometries — pool slots are
+  // reused, never disposed).
+  clearProjectiles()
+  {
+    for (let i = 0; i < this.rockets.length; i++)
+    {
+      const r = this.rockets[i];
+      if (r && r.slot)
+      {
+        this._releaseRocketProjectile(r.slot);
+      }
+      else if (r && r.mesh && r.mesh.parent)
+      {
+        // Defensive fallback (shouldn't trigger now that fireRocket always
+        // uses the pool).
+        r.mesh.parent.remove(r.mesh);
+      }
+    }
+    this.rockets.length = 0;
+
+    for (let i = 0; i < this.grenades.length; i++)
+    {
+      const g = this.grenades[i];
+      if (g && g.slot)
+      {
+        this._releaseGrenadeProjectile(g.slot);
+      }
+      else if (g && g.mesh && g.mesh.parent)
+      {
+        g.mesh.parent.remove(g.mesh);
+      }
+    }
+    this.grenades.length = 0;
+  }
+
+  // Release every active transient effect (impacts, blood, tracers, sparks,
+  // smoke, explosion sprite, lights) — used on map swap. Pooled materials
+  // and shared geometries are not disposed; pooled lights are released back
+  // to the explosion-light pool.
+  clearEffects()
+  {
+    for (let i = 0; i < this.effects.length; i++)
+    {
+      this._disposeFx(this.effects[i]);
+    }
+    this.effects.length = 0;
+  }
 
   _setHudAmmo(ctx)
   {

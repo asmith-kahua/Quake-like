@@ -128,6 +128,22 @@ window.Game = window.Game || {};
       // Active projectiles owned by this bot
       this._projectiles = [];
 
+      // Per-bot pool of glow PointLights for in-flight projectiles. Most bots
+      // never have more than 1-2 projectiles airborne at once
+      // (PROJ_RANGE_MAX/PROJ_SPEED ≈ 1.4s flight, fire cooldown ≥ 1.2s). A
+      // 4-deep pool covers the worst case without leaking lights when
+      // projectiles detonate / expire.
+      this._lightPool = [];
+      this._lightPoolSize = 4;
+      try {
+        for (let i = 0; i < this._lightPoolSize; i++) {
+          const l = new THREE.PointLight(0xff3030, 0, 4);
+          l.visible = false;
+          scene.add(l);
+          this._lightPool.push({ light: l, inUse: false });
+        }
+      } catch (e) { /* PointLight unavailable — _acquireLight will return null */ }
+
       // ---------- Build mesh ----------
       const group = new THREE.Group();
 
@@ -529,16 +545,18 @@ window.Game = window.Game || {};
       projMesh.userData.isProjectile = true;
       this.scene.add(projMesh);
 
-      // Optional point-light glow if it isn't too expensive
-      let light = null;
-      try {
-        light = new THREE.PointLight(0xff3030, 0.8, 4);
-        projMesh.add(light);
-      } catch (e) { /* ignore */ }
+      // Pull a glow PointLight from the per-bot pool. If none free, skip the
+      // light rather than allocate a fresh one (avoids per-shot light churn).
+      const lightSlot = this._acquireLight();
+      if (lightSlot) {
+        lightSlot.light.position.copy(origin);
+        lightSlot.light.intensity = 0.8;
+        lightSlot.light.visible = true;
+      }
 
       this._projectiles.push({
         mesh: projMesh,
-        light: light,
+        lightSlot: lightSlot,
         pos: origin.clone(),
         dir: dir.clone(),
         speed: PROJ_SPEED,
@@ -546,6 +564,24 @@ window.Game = window.Game || {};
         damaged: false,
         ttl: PROJ_RANGE_MAX / PROJ_SPEED + 2.0
       });
+    }
+
+    _acquireLight() {
+      for (let i = 0; i < this._lightPool.length; i++) {
+        const slot = this._lightPool[i];
+        if (!slot.inUse) {
+          slot.inUse = true;
+          return slot;
+        }
+      }
+      return null;
+    }
+
+    _releaseLight(slot) {
+      if (!slot) return;
+      slot.inUse = false;
+      slot.light.intensity = 0;
+      slot.light.visible = false;
     }
 
     _updateProjectiles(dt, ctx) {
@@ -584,6 +620,9 @@ window.Game = window.Game || {};
         p.pos.y += p.dir.y * stepDist;
         p.pos.z += p.dir.z * stepDist;
         p.mesh.position.copy(p.pos);
+        if (p.lightSlot && p.lightSlot.light) {
+          p.lightSlot.light.position.copy(p.pos);
+        }
         p.damageBudget -= PROJ_DAMAGE * dt; // tracks "potential dps drain" (caps total at 60)
 
         // Player hit test
@@ -606,16 +645,20 @@ window.Game = window.Game || {};
     }
 
     _destroyProjectile(p) {
-      if (!p || !p.mesh) return;
-      try {
-        if (p.light && p.mesh.remove) p.mesh.remove(p.light);
-      } catch (e) { /* ignore */ }
-      try {
-        if (this.scene && this.scene.remove) this.scene.remove(p.mesh);
-      } catch (e) { /* ignore */ }
-      // PROJECTILE_GEOM and PROJECTILE_MAT are shared — do NOT dispose them.
-      p.mesh = null;
-      p.light = null;
+      if (!p) return;
+      // Release the pooled light back to the pool. The light stays parented
+      // to the scene; we just dim and hide it (no per-shot scene churn).
+      if (p.lightSlot) {
+        this._releaseLight(p.lightSlot);
+        p.lightSlot = null;
+      }
+      if (p.mesh) {
+        try {
+          if (this.scene && this.scene.remove) this.scene.remove(p.mesh);
+        } catch (e) { /* ignore */ }
+        // PROJECTILE_GEOM and PROJECTILE_MAT are shared — do NOT dispose them.
+        p.mesh = null;
+      }
     }
 
     _applyHitFlash() {
