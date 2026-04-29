@@ -186,13 +186,23 @@ window.Game.Player = class {
 
     // Step-up: when an axis-separated horizontal move is blocked by a collider
     // shorter than this._stepUp above the player's feet, lift the player up by
-    // _stepUp, retest the AABB, and if the lifted box is no longer pushed back
-    // on this axis (and has clear headroom) keep the lift instead of stopping.
-    // This lets the player walk smoothly up stairs and small curbs without
-    // jumping, while taller obstacles still block as before.
+    // _stepUp and let the move continue. Constraints:
+    //   - Only fires while grounded (no aerial step-up) and not jumping up.
+    //   - At most ONE successful lift per frame across both X and Z axes.
+    //   - Lifted AABB must be FULLY CLEAR of all colliders on every axis
+    //     (lifted push must be exactly zero in x/y/z), otherwise we'd be
+    //     stepping into another wall or under a ceiling.
     const STEP_UP = this._stepUp;
     const STEP_EPS = 0.01;
     let stepped = false;
+    const canStepUp = this.onGround && this.velocity.y <= STEP_EPS;
+
+    function isLiftedClear(p) {
+      return p &&
+        Math.abs(p.x) < STEP_EPS &&
+        Math.abs(p.y) < STEP_EPS &&
+        Math.abs(p.z) < STEP_EPS;
+    }
 
     // X axis
     this.position.x += this.velocity.x * dt;
@@ -200,18 +210,20 @@ window.Game.Player = class {
       this._buildAABB(this.position);
       const pushX = level.resolveAABB(this._aabb);
       if (pushX && pushX.x !== 0) {
-        // Try a step-up before falling back to "blocked, zero velocity".
-        const savedY = this.position.y;
-        this.position.y = savedY + STEP_UP;
-        this._buildAABB(this.position);
-        const liftedPush = level.resolveAABB(this._aabb);
-        if (liftedPush && Math.abs(liftedPush.x) < STEP_EPS && liftedPush.y <= 0) {
-          // Headroom is clear AND we no longer collide horizontally on X.
-          // Accept the lift: keep raised position and velocity.
-          stepped = true;
-        } else {
-          // Still blocked or no headroom — revert lift and apply original push.
-          this.position.y = savedY;
+        let resolved = false;
+        if (canStepUp && !stepped) {
+          const savedY = this.position.y;
+          this.position.y = savedY + STEP_UP;
+          this._buildAABB(this.position);
+          const liftedPush = level.resolveAABB(this._aabb);
+          if (isLiftedClear(liftedPush)) {
+            stepped = true;
+            resolved = true;
+          } else {
+            this.position.y = savedY;
+          }
+        }
+        if (!resolved) {
           this.position.x += pushX.x;
           this.velocity.x = 0;
         }
@@ -224,14 +236,20 @@ window.Game.Player = class {
       this._buildAABB(this.position);
       const pushZ = level.resolveAABB(this._aabb);
       if (pushZ && pushZ.z !== 0) {
-        const savedY = this.position.y;
-        this.position.y = savedY + STEP_UP;
-        this._buildAABB(this.position);
-        const liftedPush = level.resolveAABB(this._aabb);
-        if (liftedPush && Math.abs(liftedPush.z) < STEP_EPS && liftedPush.y <= 0) {
-          stepped = true;
-        } else {
-          this.position.y = savedY;
+        let resolved = false;
+        if (canStepUp && !stepped) {
+          const savedY = this.position.y;
+          this.position.y = savedY + STEP_UP;
+          this._buildAABB(this.position);
+          const liftedPush = level.resolveAABB(this._aabb);
+          if (isLiftedClear(liftedPush)) {
+            stepped = true;
+            resolved = true;
+          } else {
+            this.position.y = savedY;
+          }
+        }
+        if (!resolved) {
           this.position.z += pushZ.z;
           this.velocity.z = 0;
         }
