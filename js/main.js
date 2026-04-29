@@ -388,7 +388,22 @@
   let levelComplete = false;
 
   function loadLevel(index) {
-    // Capture old camera position so children (viewmodel) carry over
+    // Defensive sweep: remove ANY level root left in scene.children.
+    // Catches edge cases where a prior dispose was racy or partial.
+    for (let i = scene.children.length - 1; i >= 0; i--) {
+      const child = scene.children[i];
+      if (child && typeof child.name === "string" && child.name.indexOf("Level") === 0) {
+        scene.remove(child);
+        child.traverse((obj) => {
+          if (obj.geometry && obj.geometry.dispose) obj.geometry.dispose();
+          if (obj.material) {
+            const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+            mats.forEach((m) => m && m.dispose && m.dispose());
+          }
+        });
+      }
+    }
+
     if (level && typeof level.dispose === "function") {
       level.dispose();
     }
