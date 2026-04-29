@@ -1,4 +1,4 @@
-// Game.Level - builds one of 4 procedurally-laid-out maps and exposes
+// Game.Level - builds one of 5 procedurally-laid-out maps and exposes
 // collision + raycast helpers used by player, enemies and weapon modules.
 //
 // API contract (relied upon by other modules):
@@ -18,6 +18,18 @@
 //   level.rocketPickup      : { position, mesh, picked } | null  (level 0 only)
 //   level.healthPickups     : [{ position, mesh, picked, amount }]
 //   level.dispose()         : remove from scene + free GPU resources
+//
+// PERF NOTE (perf/level branch):
+//   * Walls / floors / ceilings / pillars / trim are batched into a tiny set
+//     of THREE.InstancedMesh objects (one per material). Each renders in a
+//     single draw call regardless of instance count.
+//   * Visible surfaces are PlaneGeometry (2 tris) instead of BoxGeometry
+//     (12 tris). Pillars/trim slabs emit one plane per visible face.
+//   * MeshPhongMaterial replaces MeshStandardMaterial (cheaper than PBR).
+//     A per-material normal + specular map is generated procedurally from
+//     the diffuse stone canvas.
+//   * Per-level PointLight count capped to 6 (was up to ~14). Ambient and
+//     Hemisphere intensities raised to compensate.
 
 window.Game = window.Game || {};
 
@@ -45,6 +57,7 @@ window.Game.Level = class
     this._ownedTextures = [];
     this._ownedMaterials = [];
     this._ownedGeometries = [];
+    this._ownedInstancedMeshes = [];
 
     // Root group
     this.root = new THREE.Group();
@@ -55,6 +68,15 @@ window.Game.Level = class
     const palette = this._paletteForLevel(this.levelIndex);
     this._textures = this._buildTextures(palette);
     this._materials = this._buildMaterials(this._textures, palette);
+
+    // Per-instanced-material plane queues. After all builders run we pack
+    // them into one InstancedMesh per material in _finalizeInstances().
+    this._instanceQueues = {
+      wall:  [],
+      floor: [],
+      ceil:  [],
+      trim:  [],
+    };
 
     // Default spawn (overridden by builders if desired)
     this.spawnPoint = new THREE.Vector3(0, 1.7, 0);
@@ -69,6 +91,9 @@ window.Game.Level = class
       case 3: this._buildLevel3(); break;
       case 4: this._buildLevel4(); break;
     }
+
+    // Pack queued plane instances into per-material InstancedMesh objects.
+    this._finalizeInstances();
 
     // Compute overall bounds from the colliders.
     const bounds = new THREE.Box3();
@@ -183,24 +208,54 @@ window.Game.Level = class
 
   _buildTextures(p)
   {
-    const wallTex   = this._makeStoneTexture(128, p.wall[0],  p.wall[1],  0.55);
-    const floorTex  = this._makeStoneTexture(128, p.floor[0], p.floor[1], 0.45);
-    const trimTex   = this._makeStoneTexture(128, p.trim[0],  p.trim[1],  0.65);
-    const ceilTex   = this._makeStoneTexture(128, p.ceil[0],  p.ceil[1],  0.55);
+    // Generate diffuse + procedural normal + procedural spec for each
+    // surface type. All canvases are kept around (anchored on textures via
+    // CanvasTexture.image). Computing normal/spec maps from the diffuse is
+    // a one-time cost per level.
+    const wallSet  = this._buildTextureSet(128, p.wall[0],  p.wall[1],  0.55);
+    const floorSet = this._buildTextureSet(128, p.floor[0], p.floor[1], 0.45);
+    const trimSet  = this._buildTextureSet(128, p.trim[0],  p.trim[1],  0.65);
+    const ceilSet  = this._buildTextureSet(128, p.ceil[0],  p.ceil[1],  0.55);
 
-    [wallTex, floorTex, trimTex, ceilTex].forEach(t =>
+    const all = [
+      wallSet.map, wallSet.normalMap, wallSet.specularMap,
+      floorSet.map, floorSet.normalMap, floorSet.specularMap,
+      trimSet.map, trimSet.normalMap, trimSet.specularMap,
+      ceilSet.map, ceilSet.normalMap, ceilSet.specularMap,
+    ];
+    all.forEach(t =>
     {
       t.wrapS = THREE.RepeatWrapping;
       t.wrapT = THREE.RepeatWrapping;
+      // We rely on a per-instance UV scaling shader hook (see _patchPhongShader),
+      // so the texture's own .repeat stays at (1,1).
       t.repeat.set(1, 1);
       t.anisotropy = 4;
       this._ownedTextures.push(t);
     });
 
-    return { wall: wallTex, floor: floorTex, trim: trimTex, ceil: ceilTex };
+    return {
+      wall:  wallSet,
+      floor: floorSet,
+      trim:  trimSet,
+      ceil:  ceilSet,
+    };
   }
 
-  _makeStoneTexture(size, baseRGB, darkRGB, noiseAmount)
+  _buildTextureSet(size, baseRGB, darkRGB, noiseAmount)
+  {
+    const diffuseCanvas = this._makeStoneCanvas(size, baseRGB, darkRGB, noiseAmount);
+    const normalCanvas  = this._makeNormalFromCanvas(diffuseCanvas);
+    const specCanvas    = this._makeSpecFromCanvas(diffuseCanvas);
+
+    return {
+      map:         new THREE.CanvasTexture(diffuseCanvas),
+      normalMap:   new THREE.CanvasTexture(normalCanvas),
+      specularMap: new THREE.CanvasTexture(specCanvas),
+    };
+  }
+
+  _makeStoneCanvas(size, baseRGB, darkRGB, noiseAmount)
   {
     const canvas = document.createElement('canvas');
     canvas.width = size;
@@ -258,23 +313,159 @@ window.Game.Level = class
     }
     ctx.globalAlpha = 1;
 
-    const tex = new THREE.CanvasTexture(canvas);
-    tex.needsUpdate = true;
-    return tex;
+    return canvas;
+  }
+
+  // 3x3 Sobel filter on luminance to produce a tangent-space normal map.
+  // dx and dy are encoded as RGB: r = (dx+1)/2, g = (dy+1)/2, b = 1.
+  // Mortar lines (the dark seams) translate to crisp creases in the normal
+  // map, which gives the surface a tactile bumpy feel under torchlight.
+  _makeNormalFromCanvas(srcCanvas)
+  {
+    const w = srcCanvas.width;
+    const h = srcCanvas.height;
+    const srcCtx = srcCanvas.getContext('2d');
+    const src = srcCtx.getImageData(0, 0, w, h).data;
+
+    // Build a luminance buffer once for fast reuse.
+    const lum = new Float32Array(w * h);
+    for (let i = 0, j = 0; i < src.length; i += 4, j++)
+    {
+      // Rec.601-ish luminance (cheap)
+      lum[j] = (src[i] * 0.299 + src[i + 1] * 0.587 + src[i + 2] * 0.114) / 255;
+    }
+
+    const out = new Uint8ClampedArray(w * h * 4);
+    const STRENGTH = 2.5; // amplifies bumpiness; tuned to read well at torch range
+    for (let y = 0; y < h; y++)
+    {
+      const ym = (y - 1 + h) % h;
+      const yp = (y + 1) % h;
+      for (let x = 0; x < w; x++)
+      {
+        const xm = (x - 1 + w) % w;
+        const xp = (x + 1) % w;
+
+        const tl = lum[ym * w + xm];
+        const tc = lum[ym * w + x ];
+        const tr = lum[ym * w + xp];
+        const ml = lum[y  * w + xm];
+        const mr = lum[y  * w + xp];
+        const bl = lum[yp * w + xm];
+        const bc = lum[yp * w + x ];
+        const br = lum[yp * w + xp];
+
+        // Sobel
+        const dx = (tr + 2 * mr + br) - (tl + 2 * ml + bl);
+        const dy = (bl + 2 * bc + br) - (tl + 2 * tc + tr);
+
+        // Compose normal: invert dx/dy then normalize.
+        let nx = -dx * STRENGTH;
+        let ny = -dy * STRENGTH;
+        let nz = 1.0;
+        const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+        nx /= len; ny /= len; nz /= len;
+
+        const idx = (y * w + x) * 4;
+        out[idx    ] = Math.round((nx * 0.5 + 0.5) * 255);
+        out[idx + 1] = Math.round((ny * 0.5 + 0.5) * 255);
+        out[idx + 2] = Math.round((nz * 0.5 + 0.5) * 255);
+        out[idx + 3] = 255;
+      }
+    }
+
+    const dst = document.createElement('canvas');
+    dst.width = w; dst.height = h;
+    const dstCtx = dst.getContext('2d');
+    const imgData = dstCtx.createImageData(w, h);
+    imgData.data.set(out);
+    dstCtx.putImageData(imgData, 0, 0);
+    return dst;
+  }
+
+  // Specular map: brighter where mortar (dark seams in diffuse) lives, dimmer
+  // on stone face. Produces subtle highlights along grout lines, a classic
+  // wet-stone look under point lights.
+  _makeSpecFromCanvas(srcCanvas)
+  {
+    const w = srcCanvas.width;
+    const h = srcCanvas.height;
+    const srcCtx = srcCanvas.getContext('2d');
+    const src = srcCtx.getImageData(0, 0, w, h).data;
+
+    const out = new Uint8ClampedArray(w * h * 4);
+    for (let i = 0; i < src.length; i += 4)
+    {
+      const lum = (src[i] * 0.299 + src[i + 1] * 0.587 + src[i + 2] * 0.114) / 255;
+      // Invert + remap so darkest (mortar) -> 0.75, lightest (face) -> 0.15
+      const inv = 1 - lum;
+      const s = 0.15 + Math.max(0, Math.min(1, (inv - 0.2) / 0.6)) * 0.6;
+      const v = Math.round(s * 255);
+      out[i    ] = v;
+      out[i + 1] = v;
+      out[i + 2] = v;
+      out[i + 3] = 255;
+    }
+
+    const dst = document.createElement('canvas');
+    dst.width = w; dst.height = h;
+    const dstCtx = dst.getContext('2d');
+    const imgData = dstCtx.createImageData(w, h);
+    imgData.data.set(out);
+    dstCtx.putImageData(imgData, 0, 0);
+    return dst;
   }
 
   _buildMaterials(tex, p)
   {
-    const wall  = new THREE.MeshStandardMaterial({ map: tex.wall,  color: p.wallTint,  roughness: 0.95, metalness: 0.05 });
-    const floor = new THREE.MeshStandardMaterial({ map: tex.floor, color: p.floorTint, roughness: 0.9,  metalness: 0.05 });
-    const ceil  = new THREE.MeshStandardMaterial({ map: tex.ceil,  color: p.ceilTint,  roughness: 0.95, metalness: 0.0  });
-    const trim  = new THREE.MeshStandardMaterial({ map: tex.trim,  color: p.trimTint,  roughness: 0.85, metalness: 0.15 });
-    const torchEmissive = new THREE.MeshBasicMaterial({ color: p.torchEmissive });
-    const exitEmissive  = new THREE.MeshBasicMaterial({ color: 0x55ffff });
+    // MeshPhongMaterial replaces MeshStandardMaterial. Phong is a fragment-cheap
+    // Blinn-Phong shader vs StandardMaterial's full PBR roughness/metalness.
+    // Phong supports normalMap + specularMap natively. shininess + specular
+    // tint give us the highlight character.
+    const wall  = new THREE.MeshPhongMaterial({
+      map: tex.wall.map,
+      normalMap: tex.wall.normalMap,
+      specularMap: tex.wall.specularMap,
+      color: p.wallTint,
+      shininess: 18,
+      specular: 0x665544,
+    });
+    const floor = new THREE.MeshPhongMaterial({
+      map: tex.floor.map,
+      normalMap: tex.floor.normalMap,
+      specularMap: tex.floor.specularMap,
+      color: p.floorTint,
+      shininess: 22,
+      specular: 0x554433,
+    });
+    const ceil  = new THREE.MeshPhongMaterial({
+      map: tex.ceil.map,
+      normalMap: tex.ceil.normalMap,
+      specularMap: tex.ceil.specularMap,
+      color: p.ceilTint,
+      shininess: 8,
+      specular: 0x222222,
+    });
+    const trim  = new THREE.MeshPhongMaterial({
+      map: tex.trim.map,
+      normalMap: tex.trim.normalMap,
+      specularMap: tex.trim.specularMap,
+      color: p.trimTint,
+      shininess: 35,
+      specular: 0x887766,
+    });
+
+    // Patch each so that per-instance UVs scale with the instance's local
+    // dimensions — texels then tile at a consistent world-space rate
+    // regardless of plane size.
+    [wall, floor, ceil, trim].forEach(m => this._patchPhongShader(m));
+
+    const torchEmissive  = new THREE.MeshBasicMaterial({ color: p.torchEmissive });
+    const exitEmissive   = new THREE.MeshBasicMaterial({ color: 0x55ffff });
     const healthEmissive = new THREE.MeshBasicMaterial({ color: 0x33ff66 });
-    const rocketBody    = new THREE.MeshBasicMaterial({ color: 0xff7722 });
-    const rocketTip     = new THREE.MeshBasicMaterial({ color: 0xffaa44 });
-    const rocketPedestal = new THREE.MeshStandardMaterial({ color: 0x444444, roughness: 0.6, metalness: 0.4 });
+    const rocketBody     = new THREE.MeshBasicMaterial({ color: 0xff7722 });
+    const rocketTip      = new THREE.MeshBasicMaterial({ color: 0xffaa44 });
+    const rocketPedestal = new THREE.MeshPhongMaterial({ color: 0x444444, shininess: 25, specular: 0x222222 });
 
     const mats = { wall, floor, ceil, trim, torchEmissive, exitEmissive, healthEmissive, rocketBody, rocketTip, rocketPedestal };
     for (const k in mats) this._ownedMaterials.push(mats[k]);
@@ -288,53 +479,207 @@ window.Game.Level = class
     return mats;
   }
 
+  // Inject per-instance UV scaling. Each instance carries a `vec2` attribute
+  // `instanceUVScale` that multiplies the source UV. Combined with
+  // RepeatWrapping textures, this gives "tile per world unit" across all
+  // instances regardless of their world-space size.
+  _patchPhongShader(material)
+  {
+    material.onBeforeCompile = (shader) =>
+    {
+      shader.vertexShader = 'attribute vec2 instanceUVScale;\n' + shader.vertexShader;
+      // <uv_vertex> in r128 sets vUv from `uv`. Replace it so the UV is
+      // multiplied by the per-instance scale before any uvTransform.
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <uv_vertex>',
+        [
+          '#ifdef USE_UV',
+          '  vUv = ( uvTransform * vec3( uv * instanceUVScale, 1 ) ).xy;',
+          '#endif',
+        ].join('\n'),
+      );
+    };
+    // r128: ensure the material recompiles since onBeforeCompile changed.
+    material.needsUpdate = true;
+  }
+
   // ---------------------------------------------------------------------------
-  // Block builders
+  // Surface emission - planes are queued, packed into InstancedMesh later
   // ---------------------------------------------------------------------------
 
+  // Map a material to its instance-queue key, or null if the material isn't
+  // batched (e.g. emissive markers stay as plain meshes).
+  _queueKeyForMaterial(material)
+  {
+    const m = this._materials;
+    if (material === m.wall)  return 'wall';
+    if (material === m.floor) return 'floor';
+    if (material === m.ceil)  return 'ceil';
+    if (material === m.trim)  return 'trim';
+    return null;
+  }
+
+  // Add one plane instance to the queue.
+  // pos: world-space center of plane.
+  // quat: orientation (PlaneGeometry default is +Z normal).
+  // uSize/vSize: world-space dimensions (also used as UV scale = "tiles per
+  //              world unit" feeds directly because base texture is 1m^2).
+  _emitPlane(material, pos, quat, uSize, vSize)
+  {
+    const key = this._queueKeyForMaterial(material);
+    if (key == null) return;
+    this._instanceQueues[key].push({
+      pos: pos.clone(),
+      quat: quat.clone(),
+      uSize: uSize,
+      vSize: vSize,
+    });
+  }
+
+  // Emit the visible faces of an axis-aligned box. `faceMask` selects which
+  // faces to emit. Bits: +X=1, -X=2, +Y=4, -Y=8, +Z=16, -Z=32. 63 = all faces.
+  _emitBoxFaces(cx, cy, cz, sx, sy, sz, material, faceMask)
+  {
+    const halfSx = sx * 0.5, halfSy = sy * 0.5, halfSz = sz * 0.5;
+    const q = new THREE.Quaternion();
+    const pos = new THREE.Vector3();
+    const euler = new THREE.Euler();
+
+    // +X face: normal = +X, plane local-x = world-z, plane local-y = world-y
+    if (faceMask & 1)
+    {
+      euler.set(0, Math.PI * 0.5, 0);
+      q.setFromEuler(euler);
+      pos.set(cx + halfSx, cy, cz);
+      this._emitPlane(material, pos, q, sz, sy);
+    }
+    // -X face
+    if (faceMask & 2)
+    {
+      euler.set(0, -Math.PI * 0.5, 0);
+      q.setFromEuler(euler);
+      pos.set(cx - halfSx, cy, cz);
+      this._emitPlane(material, pos, q, sz, sy);
+    }
+    // +Y face (top)
+    if (faceMask & 4)
+    {
+      euler.set(-Math.PI * 0.5, 0, 0);
+      q.setFromEuler(euler);
+      pos.set(cx, cy + halfSy, cz);
+      this._emitPlane(material, pos, q, sx, sz);
+    }
+    // -Y face (bottom)
+    if (faceMask & 8)
+    {
+      euler.set(Math.PI * 0.5, 0, 0);
+      q.setFromEuler(euler);
+      pos.set(cx, cy - halfSy, cz);
+      this._emitPlane(material, pos, q, sx, sz);
+    }
+    // +Z face
+    if (faceMask & 16)
+    {
+      q.set(0, 0, 0, 1);
+      pos.set(cx, cy, cz + halfSz);
+      this._emitPlane(material, pos, q, sx, sy);
+    }
+    // -Z face
+    if (faceMask & 32)
+    {
+      euler.set(0, Math.PI, 0);
+      q.setFromEuler(euler);
+      pos.set(cx, cy, cz - halfSz);
+      this._emitPlane(material, pos, q, sx, sy);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Block builder helpers (preserve old API; emit planes + collider only)
+  // ---------------------------------------------------------------------------
+
+  // Internal helper: register collider only.
+  _addCollider(cx, cy, cz, sx, sy, sz)
+  {
+    const half = new THREE.Vector3(sx * 0.5, sy * 0.5, sz * 0.5);
+    const center = new THREE.Vector3(cx, cy, cz);
+    this.colliders.push(new THREE.Box3(
+      center.clone().sub(half),
+      center.clone().add(half),
+    ));
+  }
+
+  // Drop-in replacement for the old _addBox. Emits visible planes for the
+  // box's surfaces under the given material, and registers a collider if
+  // requested. For instanced (wall/floor/ceil/trim) materials, planes go to
+  // the instance queue and no per-mesh allocation occurs. For non-instanced
+  // materials (e.g. exit emissive marker), a plain Mesh is added so existing
+  // visual behaviour is preserved for those one-offs.
   _addBox(group, cx, cy, cz, sx, sy, sz, material, collide)
   {
+    if (collide)
+    {
+      this._addCollider(cx, cy, cz, sx, sy, sz);
+    }
+
+    const key = this._queueKeyForMaterial(material);
+    if (key != null)
+    {
+      // Generic box: emit all 6 faces. Backface culling will drop the ones
+      // that face away from the camera; remaining faces still pay vertex cost
+      // but render in the parent material's single draw call.
+      this._emitBoxFaces(cx, cy, cz, sx, sy, sz, material, 63);
+      return null;
+    }
+
+    // Non-instanced fallback (emissive markers etc.)
     const geom = new THREE.BoxGeometry(sx, sy, sz);
     this._ownedGeometries.push(geom);
     const mesh = new THREE.Mesh(geom, material);
     mesh.position.set(cx, cy, cz);
     mesh.receiveShadow = true;
     mesh.castShadow = false;
-    group.add(mesh);
-    this.collidableMeshes.push(mesh);
-    if (collide)
-    {
-      const half = new THREE.Vector3(sx * 0.5, sy * 0.5, sz * 0.5);
-      const center = new THREE.Vector3(cx, cy, cz);
-      const box = new THREE.Box3(
-        center.clone().sub(half),
-        center.clone().add(half),
-      );
-      this.colliders.push(box);
-    }
+    (group || this.root).add(mesh);
     return mesh;
   }
 
+  // Floor slab. Visually only the top is seen, so emit a single +Y plane.
+  // No collider for floors (player gravity handles ground).
   _addFloor(group, cx, cz, sx, sz)
   {
-    const t = 0.5;
-    return this._addBox(group, cx, -t * 0.5, cz, sx, t, sz, this._materials.floor, false);
+    const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(-Math.PI * 0.5, 0, 0));
+    const pos = new THREE.Vector3(cx, 0, cz);
+    this._emitPlane(this._materials.floor, pos, q, sx, sz);
+    return null;
   }
 
+  // Ceiling slab. Only the bottom is seen from below, so emit a single -Y plane.
   _addCeiling(group, cx, cy, cz, sx, sz)
   {
-    const t = 0.5;
-    return this._addBox(group, cx, cy + t * 0.5, cz, sx, t, sz, this._materials.ceil, false);
+    const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.PI * 0.5, 0, 0));
+    const pos = new THREE.Vector3(cx, cy, cz);
+    this._emitPlane(this._materials.ceil, pos, q, sx, sz);
+    return null;
   }
 
+  // Wall along X axis. The wall is thin in Z. Both Z faces can be seen at
+  // various times (e.g. inner corridor walls), so emit two planes back-to-back.
+  // Skip the top/bottom/end faces — they're hidden by floor/ceiling/joining walls.
   _wallX(group, cx, cy, cz, length, height)
   {
-    return this._addBox(group, cx, cy + height * 0.5, cz, length, height, 0.5, this._materials.wall, true);
+    // Collider matches the original BoxGeometry footprint (length, height, 0.5).
+    const ccy = cy + height * 0.5;
+    this._addCollider(cx, ccy, cz, length, height, 0.5);
+    // Two plane faces facing +Z and -Z.
+    this._emitBoxFaces(cx, ccy, cz, length, height, 0.5, this._materials.wall, 16 | 32);
   }
 
   _wallZ(group, cx, cy, cz, length, height)
   {
-    return this._addBox(group, cx, cy + height * 0.5, cz, 0.5, height, length, this._materials.wall, true);
+    const ccy = cy + height * 0.5;
+    this._addCollider(cx, ccy, cz, 0.5, height, length);
+    // Two plane faces facing +X and -X.
+    this._emitBoxFaces(cx, ccy, cz, 0.5, height, length, this._materials.wall, 1 | 2);
   }
 
   // Build a wall along X with a doorway opening at (openCx, openWidth). Doorway at floor up to doorH.
@@ -382,6 +727,62 @@ window.Game.Level = class
     if (lintelH > 0.05)
     {
       this._addBox(group, cx, doorH + lintelH * 0.5, openCz, 0.5, lintelH, openWidth, this._materials.trim, true);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // InstancedMesh finalize - one draw call per material
+  // ---------------------------------------------------------------------------
+
+  _finalizeInstances()
+  {
+    // Shared unit plane geometry used by every InstancedMesh. Each instance
+    // matrix scales the unit plane (from -0.5..0.5 in local x/y) to its world
+    // size, so the geometry is reused across all instances in all materials.
+    const planeGeom = new THREE.PlaneGeometry(1, 1);
+    this._ownedGeometries.push(planeGeom);
+
+    const mat4 = new THREE.Matrix4();
+    const scale = new THREE.Vector3();
+
+    const keys = Object.keys(this._instanceQueues);
+    for (let i = 0; i < keys.length; i++)
+    {
+      const key = keys[i];
+      const queue = this._instanceQueues[key];
+      const count = queue.length;
+      if (count === 0) continue;
+
+      const material = this._materials[key];
+      const im = new THREE.InstancedMesh(planeGeom, material, count);
+      im.name = 'Instanced_' + key;
+      im.frustumCulled = false; // bbox of merged instances is wide; skip per-mesh frustum
+      im.receiveShadow = true;
+      im.castShadow = false;
+
+      // Per-instance UV scale (vec2 = u-tiles, v-tiles, derived from world size).
+      const uvScales = new Float32Array(count * 2);
+      const uvAttr = new THREE.InstancedBufferAttribute(uvScales, 2);
+      uvAttr.setUsage(THREE.StaticDrawUsage);
+
+      for (let k = 0; k < count; k++)
+      {
+        const inst = queue[k];
+        scale.set(inst.uSize, inst.vSize, 1);
+        mat4.compose(inst.pos, inst.quat, scale);
+        im.setMatrixAt(k, mat4);
+        uvScales[k * 2    ] = inst.uSize;
+        uvScales[k * 2 + 1] = inst.vSize;
+      }
+      im.instanceMatrix.needsUpdate = true;
+      im.geometry.setAttribute('instanceUVScale', uvAttr);
+
+      this.root.add(im);
+      this._ownedInstancedMeshes.push(im);
+      this.collidableMeshes.push(im);
+
+      // We can drop the queue after baking.
+      this._instanceQueues[key] = null;
     }
   }
 
@@ -462,30 +863,55 @@ window.Game.Level = class
     };
   }
 
+  // Add baseline ambient + hemisphere lighting AND up to 6 dominant
+  // PointLights (pre-sorted by intensity by the caller). Per-fragment
+  // PointLight cost is the most expensive part of the lighting model with
+  // this many surfaces; capping the count is the single biggest GPU win.
   _addLighting(torches)
   {
     const m = this._materials;
-    const ambient = new THREE.AmbientLight(m._ambient, 0.35);
+
+    // Brightened to compensate for fewer point lights. Old: ambient 0.35,
+    // hemi 0.25. New: ambient 0.6, hemi 0.45.
+    const ambient = new THREE.AmbientLight(m._ambient, 0.6);
     this.root.add(ambient);
-    const hemi = new THREE.HemisphereLight(m._hemiSky, m._hemiGround, 0.25);
+    const hemi = new THREE.HemisphereLight(m._hemiSky, m._hemiGround, 0.45);
     this.root.add(hemi);
 
     const torchGeom = new THREE.SphereGeometry(0.12, 8, 6);
     this._ownedGeometries.push(torchGeom);
 
-    torches.forEach(t =>
+    // Sort by intensity (descending) and keep the brightest 6 as PointLights;
+    // the rest are still placed as visible torch sphere meshes (cheap, no
+    // lighting cost) so the room "looks lit" the same.
+    const MAX_POINT_LIGHTS = 6;
+    const sorted = torches.slice().sort((a, b) =>
     {
+      const ai = (a.intensity != null) ? a.intensity : 1.0;
+      const bi = (b.intensity != null) ? b.intensity : 1.0;
+      return bi - ai;
+    });
+
+    for (let i = 0; i < sorted.length; i++)
+    {
+      const t = sorted[i];
       const intensity = (t.intensity != null) ? t.intensity : 1.0;
       const range = (t.range != null) ? t.range : 12;
-      const light = new THREE.PointLight(m._torchColor, intensity, range, 2);
-      light.position.copy(t.p);
-      this.root.add(light);
 
+      if (i < MAX_POINT_LIGHTS)
+      {
+        const light = new THREE.PointLight(m._torchColor, intensity, range, 2);
+        light.position.copy(t.p);
+        this.root.add(light);
+      }
+
+      // Visible torch sphere (always added for visual continuity; basic mat,
+      // unaffected by scene lighting and effectively free).
       const sphere = new THREE.Mesh(torchGeom, m.torchEmissive);
       sphere.position.copy(t.p);
       sphere.position.y -= 0.05;
       this.root.add(sphere);
-    });
+    }
   }
 
   // ===========================================================================
@@ -1770,6 +2196,13 @@ window.Game.Level = class
   // ---------------------------------------------------------------------------
   // Raycast against world geometry
   // ---------------------------------------------------------------------------
+  //
+  // Three.js r128 supports raycasting against InstancedMesh: hits include an
+  // `instanceId` field, and `face.normal` is in the LOCAL plane space (which
+  // for our PlaneGeometry is +Z). To recover the world-space normal we use
+  // the per-instance matrix (im.getMatrixAt) -> normal matrix, the same way
+  // we'd handle a regular mesh's matrixWorld but composed with the instance
+  // transform.
 
   raycastWalls(origin, dir, maxDist)
   {
@@ -1786,8 +2219,22 @@ window.Game.Level = class
     if (h.face && h.face.normal)
     {
       normal = h.face.normal.clone();
-      const nm = new THREE.Matrix3().getNormalMatrix(h.object.matrixWorld);
-      normal.applyMatrix3(nm).normalize();
+      // For an InstancedMesh hit we need to combine the instance's local
+      // transform with the mesh's matrixWorld to derive the world-space
+      // normal matrix.
+      if (h.object && h.object.isInstancedMesh && (h.instanceId != null))
+      {
+        const instMat = new THREE.Matrix4();
+        h.object.getMatrixAt(h.instanceId, instMat);
+        const composed = new THREE.Matrix4().multiplyMatrices(h.object.matrixWorld, instMat);
+        const nm = new THREE.Matrix3().getNormalMatrix(composed);
+        normal.applyMatrix3(nm).normalize();
+      }
+      else
+      {
+        const nm = new THREE.Matrix3().getNormalMatrix(h.object.matrixWorld);
+        normal.applyMatrix3(nm).normalize();
+      }
     }
     else
     {
@@ -1831,6 +2278,11 @@ window.Game.Level = class
       });
     }
     // Dispose any tracked resources we own that may not have been traversed
+    for (let i = 0; i < this._ownedInstancedMeshes.length; i++)
+    {
+      const im = this._ownedInstancedMeshes[i];
+      if (im && typeof im.dispose === 'function') im.dispose();
+    }
     for (let i = 0; i < this._ownedGeometries.length; i++)
     {
       const g = this._ownedGeometries[i];
@@ -1846,6 +2298,7 @@ window.Game.Level = class
       const t = this._ownedTextures[i];
       if (t && typeof t.dispose === 'function') t.dispose();
     }
+    this._ownedInstancedMeshes.length = 0;
     this._ownedGeometries.length = 0;
     this._ownedMaterials.length = 0;
     this._ownedTextures.length = 0;
