@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>QUAKE-LIKE</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background: #000;
+    font-family: "Courier New", monospace;
+    color: #d8b070;
+    user-select: none;
+  }
+  canvas { display: block; }
+
+  #hud {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 10;
+  }
+
+  #crosshair {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 20px;
+    height: 20px;
+    margin: -10px 0 0 -10px;
+    border: 1px solid rgba(255, 200, 120, 0.55);
+    border-radius: 50%;
+    box-shadow: 0 0 6px rgba(0,0,0,0.8) inset;
+  }
+  #crosshair::before, #crosshair::after {
+    content: "";
+    position: absolute;
+    background: rgba(255, 200, 120, 0.7);
+  }
+  #crosshair::before { left: 9px; top: 2px;  width: 2px; height: 6px; }
+  #crosshair::after  { left: 9px; bottom:2px; width: 2px; height: 6px; }
+
+  #stats {
+    position: absolute;
+    left: 24px;
+    bottom: 18px;
+    font-size: 22px;
+    letter-spacing: 2px;
+    text-shadow: 2px 2px 0 #000;
+  }
+  #stats .label { opacity: 0.7; font-size: 12px; display: block; }
+  #stats .row { display: inline-block; margin-right: 28px; }
+  #stats .val { color: #ffcc66; }
+  #stats .val.low { color: #ff5050; }
+  #weapon-name { color: #ffaa44; }
+
+  #topbar {
+    position: absolute;
+    left: 24px;
+    top: 18px;
+    font-size: 14px;
+    letter-spacing: 3px;
+    text-shadow: 2px 2px 0 #000;
+    line-height: 1.5;
+  }
+  #topbar .lvl { color: #ffd58f; font-size: 18px; }
+  #topbar .net { color: #66ddcc; opacity: 0.8; font-size: 12px; }
+  #topbar .net.off { color: #888; }
+
+  #message {
+    position: absolute;
+    left: 0; right: 0;
+    top: 32%;
+    text-align: center;
+    font-size: 28px;
+    letter-spacing: 4px;
+    text-shadow: 2px 2px 0 #000;
+    transition: opacity 0.4s;
+  }
+
+  #overlay {
+    position: fixed;
+    inset: 0;
+    background: radial-gradient(ellipse at center, #1a0a05 0%, #000 100%);
+    color: #d8b070;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    text-align: center;
+    padding: 40px;
+    box-sizing: border-box;
+  }
+  #overlay h1 {
+    font-size: 64px;
+    letter-spacing: 12px;
+    margin: 0 0 12px;
+    color: #ff8030;
+    text-shadow: 3px 3px 0 #000, 0 0 20px rgba(255, 100, 0, 0.6);
+  }
+  #overlay h2 {
+    font-size: 22px;
+    letter-spacing: 4px;
+    margin: 0 0 30px;
+    opacity: 0.7;
+  }
+  #overlay .controls {
+    font-size: 13px;
+    line-height: 1.85;
+    letter-spacing: 1px;
+    opacity: 0.85;
+    margin-bottom: 24px;
+  }
+  #overlay .mp {
+    display: flex;
+    gap: 8px;
+    margin: 8px 0 18px;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+  #overlay .mp label {
+    font-size: 11px;
+    letter-spacing: 2px;
+    opacity: 0.7;
+  }
+  #overlay .mp input {
+    background: rgba(40, 22, 12, 0.8);
+    color: #ffd590;
+    border: 1px solid #6a4828;
+    padding: 6px 10px;
+    font-family: inherit;
+    font-size: 13px;
+    letter-spacing: 1px;
+    outline: none;
+    width: 220px;
+  }
+  #overlay .mp input:focus { border-color: #d8b070; }
+  #overlay .mp input.short { width: 110px; }
+  #overlay .buttons {
+    display: flex;
+    gap: 16px;
+    margin-top: 4px;
+  }
+  #overlay button {
+    background: rgba(40, 22, 12, 0.8);
+    color: #ffd590;
+    border: 1px solid #d8b070;
+    padding: 12px 22px;
+    font-family: inherit;
+    font-size: 14px;
+    letter-spacing: 5px;
+    cursor: pointer;
+    pointer-events: auto;
+    transition: all 0.15s;
+  }
+  #overlay button:hover { background: #d8b070; color: #1a0a05; }
+  #overlay button.primary { color: #ffaa44; border-color: #ffaa44; }
+  #overlay button.primary:hover { background: #ffaa44; color: #1a0a05; }
+
+  #damage-flash {
+    position: fixed;
+    inset: 0;
+    background: rgba(255, 0, 0, 0);
+    pointer-events: none;
+    z-index: 5;
+    transition: background 0.18s ease-out;
+  }
+
+  #pickup-flash {
+    position: fixed;
+    inset: 0;
+    background: rgba(80, 255, 120, 0);
+    pointer-events: none;
+    z-index: 5;
+    transition: background 0.25s ease-out;
+  }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <div id="topbar">
+    <div class="lvl" id="level-name">SLIPGATE COMPLEX</div>
+    <div class="net off" id="net-status">OFFLINE</div>
+  </div>
+  <div id="crosshair"></div>
+  <div id="stats">
+    <span class="row"><span class="label">HEALTH</span><span class="val" id="health">100</span></span>
+    <span class="row"><span class="label">ARMOR</span><span class="val" id="armor">0</span></span>
+    <span class="row"><span class="label">AMMO</span><span class="val" id="ammo">50</span></span>
+    <span class="row"><span class="label">WEAPON</span><span class="val" id="weapon-name">RIFLE</span></span>
+    <span class="row"><span class="label">KILLS</span><span class="val" id="kills">0 / 0</span></span>
+  </div>
+  <div id="message"></div>
+</div>
+
+<div id="damage-flash"></div>
+<div id="pickup-flash"></div>
+
+<div id="overlay">
+  <h1>QUAKE-LIKE</h1>
+  <h2>FOUR LEVELS - LAN MULTIPLAYER</h2>
+  <div class="controls">
+    WASD: MOVE&nbsp;&nbsp;|&nbsp;&nbsp;MOUSE: LOOK&nbsp;&nbsp;|&nbsp;&nbsp;LMB: FIRE&nbsp;&nbsp;|&nbsp;&nbsp;1: RIFLE&nbsp;&nbsp;|&nbsp;&nbsp;2: ROCKET<br>
+    SHIFT: SPRINT&nbsp;&nbsp;|&nbsp;&nbsp;SPACE: JUMP&nbsp;&nbsp;|&nbsp;&nbsp;M: MINIMAP&nbsp;&nbsp;|&nbsp;&nbsp;R: RESPAWN&nbsp;&nbsp;|&nbsp;&nbsp;ESC: RELEASE
+  </div>
+  <div class="mp">
+    <label>NAME</label>
+    <input type="text" id="player-name" class="short" placeholder="PLAYER" maxlength="12">
+    <label>SERVER</label>
+    <input type="text" id="server-url" placeholder="ws://localhost:8080" value="ws://localhost:8080">
+  </div>
+  <div class="buttons">
+    <button class="primary" id="btn-solo">PLAY SOLO</button>
+    <button id="btn-mp">JOIN MULTIPLAYER</button>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="js/level.js"></script>
+<script src="js/player.js"></script>
+<script src="js/enemies.js"></script>
+<script src="js/weapons.js"></script>
+<script src="js/sound.js"></script>
+<script src="js/minimap.js"></script>
+<script src="js/network.js"></script>
+<script src="js/main.js"></script>
+
+</body>
+</html>

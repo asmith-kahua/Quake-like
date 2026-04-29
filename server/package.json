@@ -1,0 +1,16 @@
+{
+  "name": "quake-mp-server",
+  "version": "0.1.0",
+  "description": "Local-network multiplayer relay server for Three.js Quake clone.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
