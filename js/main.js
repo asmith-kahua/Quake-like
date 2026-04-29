@@ -95,7 +95,16 @@
   let currentLevelIndex = 0;
   let level   = new Game.Level(scene, currentLevelIndex);
   let player  = new Game.Player(scene, camera, level, ui, renderer.domElement);
-  let enemies = Game.spawnEnemies(scene, level);
+
+  // Solo: spawn bots scaled by level. Difficulty: easy 0-1, medium 2-3, hard 4.
+  function spawnSoloOpponents(scene_, lvl) {
+    if (!Game.spawnBots) return Game.spawnEnemies(scene_, lvl);
+    const idx = (lvl && typeof lvl.levelIndex === "number") ? lvl.levelIndex : 0;
+    const difficulty = idx <= 1 ? "easy" : (idx <= 3 ? "medium" : "hard");
+    const count = (lvl.enemySpawns && lvl.enemySpawns.length) || 4;
+    return Game.spawnBots(scene_, lvl, count, difficulty);
+  }
+  let enemies = spawnSoloOpponents(scene, level);
   let weapon  = new Game.Weapon(scene, camera, ui);
 
   ui.setHealth(player.health);
@@ -523,7 +532,7 @@
     currentLevelIndex = THREE.MathUtils.clamp(index, 0, MAX_MAP_INDEX);
     level = new Game.Level(scene, currentLevelIndex);
     // PvP mode: don't spawn mobs - it's a deathmatch arena.
-    enemies = multiplayerMode ? [] : Game.spawnEnemies(scene, level);
+    enemies = multiplayerMode ? [] : spawnSoloOpponents(scene, level);
 
     // Re-anchor the player
     player.level = level;
