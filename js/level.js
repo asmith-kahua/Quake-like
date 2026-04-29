@@ -1504,19 +1504,31 @@ window.Game.Level = class
     this._addBox(g, 2.75, 4.6, 7.75, 9.5, 0.8, 0.2, this._materials.trim, true);
 
     // ---- Staircase ramp 1: SE area, climbs in -z to land on east catwalk ----
-    // Steps 2u wide (x[7.5..9.5]) at increasing y. Top step lands at z=-2 y=4.
-    // Each step 1u tall, 1.2u deep along z. Solid blocks (cy=sy/2 means top at sy).
-    this._addBox(g, 8.5, 0.5, -6.4, 2.0, 1.0, 1.2, this._materials.trim, true); // y top 1
-    this._addBox(g, 8.5, 1.0, -5.2, 2.0, 2.0, 1.2, this._materials.trim, true); // y top 2
-    this._addBox(g, 8.5, 1.5, -4.0, 2.0, 3.0, 1.2, this._materials.trim, true); // y top 3
-    this._addBox(g, 8.5, 2.0, -2.8, 2.0, 4.0, 1.2, this._materials.trim, true); // y top 4
+    // 8 steps 2u wide (x[7.5..9.5]), 0.6u deep along z, each step rising 0.5u.
+    // Step rise of 0.5u is below player.js STEP_UP (0.55), so the player walks
+    // smoothly up without jumping. Solid stacked blocks (cy = sy/2 -> top at sy).
+    // Top step at z=-2.5 lands at y=4 — the east catwalk top is y=4.2 (a final
+    // 0.2u stride that auto step-up handles).
+    this._addBox(g, 8.5, 0.25, -6.7, 2.0, 0.5, 0.6, this._materials.trim, true); // y top 0.5
+    this._addBox(g, 8.5, 0.5,  -6.1, 2.0, 1.0, 0.6, this._materials.trim, true); // y top 1.0
+    this._addBox(g, 8.5, 0.75, -5.5, 2.0, 1.5, 0.6, this._materials.trim, true); // y top 1.5
+    this._addBox(g, 8.5, 1.0,  -4.9, 2.0, 2.0, 0.6, this._materials.trim, true); // y top 2.0
+    this._addBox(g, 8.5, 1.25, -4.3, 2.0, 2.5, 0.6, this._materials.trim, true); // y top 2.5
+    this._addBox(g, 8.5, 1.5,  -3.7, 2.0, 3.0, 0.6, this._materials.trim, true); // y top 3.0
+    this._addBox(g, 8.5, 1.75, -3.1, 2.0, 3.5, 0.6, this._materials.trim, true); // y top 3.5
+    this._addBox(g, 8.5, 2.0,  -2.5, 2.0, 4.0, 0.6, this._materials.trim, true); // y top 4.0
 
     // ---- Staircase ramp 2: NW area, climbs in +x to land on north catwalk ----
-    // Steps 2u deep (z[7.5..9.5]) at increasing y. Top step lands at x=-2 y=4.
-    this._addBox(g, -6.4, 0.5, 8.5, 1.2, 1.0, 2.0, this._materials.trim, true); // y top 1
-    this._addBox(g, -5.2, 1.0, 8.5, 1.2, 2.0, 2.0, this._materials.trim, true); // y top 2
-    this._addBox(g, -4.0, 1.5, 8.5, 1.2, 3.0, 2.0, this._materials.trim, true); // y top 3
-    this._addBox(g, -2.8, 2.0, 8.5, 1.2, 4.0, 2.0, this._materials.trim, true); // y top 4
+    // 8 steps 2u deep (z[7.5..9.5]), 0.6u along x, each step rising 0.5u.
+    // Top step at x=-2.5 lands at y=4 — the north catwalk top is y=4.2.
+    this._addBox(g, -6.7, 0.25, 8.5, 0.6, 0.5, 2.0, this._materials.trim, true); // y top 0.5
+    this._addBox(g, -6.1, 0.5,  8.5, 0.6, 1.0, 2.0, this._materials.trim, true); // y top 1.0
+    this._addBox(g, -5.5, 0.75, 8.5, 0.6, 1.5, 2.0, this._materials.trim, true); // y top 1.5
+    this._addBox(g, -4.9, 1.0,  8.5, 0.6, 2.0, 2.0, this._materials.trim, true); // y top 2.0
+    this._addBox(g, -4.3, 1.25, 8.5, 0.6, 2.5, 2.0, this._materials.trim, true); // y top 2.5
+    this._addBox(g, -3.7, 1.5,  8.5, 0.6, 3.0, 2.0, this._materials.trim, true); // y top 3.0
+    this._addBox(g, -3.1, 1.75, 8.5, 0.6, 3.5, 2.0, this._materials.trim, true); // y top 3.5
+    this._addBox(g, -2.5, 2.0,  8.5, 0.6, 4.0, 2.0, this._materials.trim, true); // y top 4.0
 
     // ---- RJ-only perch at y=7 over courtyard centre ----
     // 2x2x0.4 platform (top at y=7.2). Catwalk top at 4.2, so a 3u vertical
