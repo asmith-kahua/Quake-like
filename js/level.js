@@ -10,6 +10,9 @@
 //   level.resolveAABB(box)  : THREE.Vector3  - minimum translation push-out summed over overlaps.
 //   level.resolveAABBAxis(box, axis) : scalar push-out along one axis
 //   level.raycastWalls(o,d,maxDist) : { point, distance, normal, mesh } | null
+//   level.raycastColliders(o,d,maxDist) : { point, distance, normal, mesh:null } | null
+//                                          (FAST Box3 sweep - preferred for
+//                                          bullets, projectiles, AI line-of-sight)
 //
 //   level.levelIndex        : 0..4
 //   level.levelName         : string
@@ -54,6 +57,13 @@ window.Game.Level = class
     // Reusable scratch objects to avoid allocations in hot paths
     this._scratchVec = new THREE.Vector3();
     this._raycaster = new THREE.Raycaster();
+    // Scratch state for raycastColliders (Box3-sweep). Pre-allocated so the
+    // hot path performs zero allocations beyond cloning the returned hit.
+    this._rcRay     = new THREE.Ray();
+    this._rcDir     = new THREE.Vector3();
+    this._rcHit     = new THREE.Vector3();
+    this._rcBest    = new THREE.Vector3();
+    this._rcNormal  = new THREE.Vector3();
     this._ownedTextures = [];
     this._ownedMaterials = [];
     this._ownedGeometries = [];
@@ -2269,6 +2279,99 @@ window.Game.Level = class
       distance: h.distance,
       normal: normal,
       mesh: h.object,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // FAST wall-occlusion raycast: sweep against the Box3 collider list.
+  // ---------------------------------------------------------------------------
+  //
+  // Use this in preference to `raycastWalls` whenever the caller only needs to
+  // know "did the ray hit a wall, and if so where?" - i.e. bullet wall hits,
+  // projectile collision, AI line-of-sight. It is dramatically cheaper than
+  // `raycastWalls` because it does O(N) AABB tests (N ~ 50-150 boxes) rather
+  // than iterating every per-instance triangle of the level's InstancedMesh
+  // batches (which Three.js r128 does internally for each InstancedMesh in
+  // Raycaster.intersectObjects).
+  //
+  // `raycastWalls` is still the right call if you need a real mesh object
+  // (e.g. picking up a face normal from a non-axis-aligned surface or
+  // identifying which mesh was hit). For the axis-aligned world geometry that
+  // makes up the level, this method's normal is exact.
+  //
+  // Returns { point, distance, normal, mesh:null } or null. `point` and
+  // `normal` are freshly allocated Vector3s safe for the caller to retain.
+  raycastColliders(origin, direction, maxDist)
+  {
+    const colliders = this.colliders;
+    const n = colliders.length;
+    if (n === 0) return null;
+
+    const far = (maxDist != null) ? maxDist : 1000;
+
+    // Set up the ray once, with a normalized direction.
+    const dir = this._rcDir.copy(direction).normalize();
+    const ray = this._rcRay;
+    ray.origin.copy(origin);
+    ray.direction.copy(dir);
+
+    let bestDistSq = Infinity;
+    let bestBox = null;
+    const farSq = far * far;
+
+    for (let i = 0; i < n; i++)
+    {
+      const box = colliders[i];
+      // intersectBox writes into the target Vector3 and returns it on hit, or
+      // null on miss. Its result is the entry point of the ray into the box
+      // (or origin if origin is already inside).
+      const hit = ray.intersectBox(box, this._rcHit);
+      if (hit === null) continue;
+
+      const dx = hit.x - origin.x;
+      const dy = hit.y - origin.y;
+      const dz = hit.z - origin.z;
+      const dSq = dx * dx + dy * dy + dz * dz;
+      if (dSq > farSq) continue;
+      if (dSq >= bestDistSq) continue;
+
+      bestDistSq = dSq;
+      bestBox = box;
+      this._rcBest.copy(hit);
+    }
+
+    if (bestBox === null) return null;
+
+    // Recover the surface normal by detecting which face of the Box3 the hit
+    // point sits on. For an axis-aligned box the hit lies on exactly one face
+    // (within numerical tolerance); pick the closest plane on each axis.
+    const eps = 1e-4;
+    const p = this._rcBest;
+    const dxMin = Math.abs(p.x - bestBox.min.x);
+    const dxMax = Math.abs(p.x - bestBox.max.x);
+    const dyMin = Math.abs(p.y - bestBox.min.y);
+    const dyMax = Math.abs(p.y - bestBox.max.y);
+    const dzMin = Math.abs(p.z - bestBox.min.z);
+    const dzMax = Math.abs(p.z - bestBox.max.z);
+
+    let best = dxMin;
+    let nx = -1, ny = 0, nz = 0;
+    if (dxMax < best) { best = dxMax; nx =  1; ny = 0; nz = 0; }
+    if (dyMin < best) { best = dyMin; nx =  0; ny = -1; nz = 0; }
+    if (dyMax < best) { best = dyMax; nx =  0; ny =  1; nz = 0; }
+    if (dzMin < best) { best = dzMin; nx =  0; ny = 0; nz = -1; }
+    if (dzMax < best) { best = dzMax; nx =  0; ny = 0; nz =  1; }
+
+    // `eps` is informational only - we already picked the closest face. If the
+    // ray grazed past the box on a single axis the picked normal will still be
+    // the closest plane, which matches Three.js Raycaster behaviour.
+    void eps;
+
+    return {
+      point: this._rcBest.clone(),
+      distance: Math.sqrt(bestDistSq),
+      normal: this._rcNormal.set(nx, ny, nz).clone(),
+      mesh: null,
     };
   }
 

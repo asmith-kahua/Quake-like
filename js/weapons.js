@@ -1154,38 +1154,54 @@ window.Game.Weapon = class
       this._dir.normalize();
     }
 
-    const targets = this._gatherTargets(ctx);
+    // Split the raycast: walls via fast Box3 sweep, entities via the usual
+    // Raycaster (the entity list is small). Whichever is closer wins.
+    const wallHit = (ctx && ctx.level && typeof ctx.level.raycastColliders === 'function')
+      ? ctx.level.raycastColliders(this._origin, this._dir, this.rifle.maxRange)
+      : null;
 
-    this.raycaster.set(this._origin, this._dir);
-    this.raycaster.near = 0;
-    this.raycaster.far = this.rifle.maxRange;
-
-    const hits = this.raycaster.intersectObjects(targets, false);
+    const entityTargets = this._gatherEntityTargets(ctx);
+    let entityHit = null;
+    if (entityTargets.length > 0)
+    {
+      this.raycaster.set(this._origin, this._dir);
+      this.raycaster.near = 0;
+      this.raycaster.far = this.rifle.maxRange;
+      const hits = this.raycaster.intersectObjects(entityTargets, false);
+      if (hits.length > 0) entityHit = hits[0];
+    }
 
     let hitPoint = null;
+    const wallDist   = wallHit   ? wallHit.distance   : Infinity;
+    const entityDist = entityHit ? entityHit.distance : Infinity;
 
-    if (hits.length > 0)
+    if (entityHit && entityDist <= wallDist)
     {
-      const h = hits[0];
-      hitPoint = h.point;
-      const ud = h.object && h.object.userData ? h.object.userData : null;
+      hitPoint = entityHit.point;
+      const ud = entityHit.object && entityHit.object.userData ? entityHit.object.userData : null;
       const enemyRef = ud ? ud.enemyRef : null;
       const peerId   = ud ? ud.peerId   : null;
 
       if (enemyRef && enemyRef.alive && typeof enemyRef.takeDamage === 'function')
       {
-        try { enemyRef.takeDamage(this.rifle.damage, h.point); } catch (e) { /* ignore */ }
-        this._spawnBlood(h.point);
+        try { enemyRef.takeDamage(this.rifle.damage, entityHit.point); } catch (e) { /* ignore */ }
+        this._spawnBlood(entityHit.point);
       }
       else if (peerId && ctx && ctx.network && typeof ctx.network.sendHit === 'function')
       {
         try { ctx.network.sendHit(peerId, this.rifle.damage); } catch (e) { /* ignore */ }
-        this._spawnBlood(h.point);
+        this._spawnBlood(entityHit.point);
       }
       else
       {
-        this._spawnImpact(h.point, h.face ? h.face.normal : null, h.object);
+        // Mesh that's neither an enemy nor a peer - treat as a generic impact.
+        this._spawnImpact(entityHit.point, entityHit.face ? entityHit.face.normal : null, entityHit.object);
       }
+    }
+    else if (wallHit)
+    {
+      hitPoint = wallHit.point;
+      this._spawnImpact(wallHit.point, wallHit.normal, null);
     }
 
     const tracerEnd = hitPoint
@@ -1200,16 +1216,14 @@ window.Game.Weapon = class
     this._setHudAmmo(ctx);
   }
 
-  _gatherTargets(ctx)
+  // Entity-only target list for weapon raycasts. Walls are NOT included;
+  // bullet/projectile vs. wall queries go through ctx.level.raycastColliders
+  // (a fast Box3 sweep) instead of Raycaster.intersectObjects against the
+  // level's InstancedMesh batches (which iterates EVERY instance internally
+  // in r128 - the source of per-shot lag).
+  _gatherEntityTargets(ctx)
   {
     const targets = [];
-    if (ctx && ctx.level && ctx.level.collidableMeshes)
-    {
-      for (let i = 0; i < ctx.level.collidableMeshes.length; i++)
-      {
-        targets.push(ctx.level.collidableMeshes[i]);
-      }
-    }
     if (ctx && ctx.enemies)
     {
       for (let i = 0; i < ctx.enemies.length; i++)
@@ -1362,31 +1376,51 @@ window.Game.Weapon = class
 
       if (stepLen > 1e-6)
       {
-        const targets = this._gatherTargets(ctx);
         const segDir = this._tmpVec.copy(r.pos).sub(r.prevPos).normalize();
-        this.raycaster.set(r.prevPos, segDir);
-        this.raycaster.near = 0;
-        this.raycaster.far = stepLen + 0.001;
-        const hits = this.raycaster.intersectObjects(targets, false);
-        if (hits.length > 0)
+
+        // Wall hit via fast Box3 sweep.
+        const wallHit = (ctx && ctx.level && typeof ctx.level.raycastColliders === 'function')
+          ? ctx.level.raycastColliders(r.prevPos, segDir, stepLen + 0.001)
+          : null;
+
+        // Entity hit via Raycaster against the (small) entity list.
+        const entityTargets = this._gatherEntityTargets(ctx);
+        let firstEntityHit = null;
+        if (entityTargets.length > 0)
         {
-          // ignore hits on our own projectile mesh (defence-in-depth)
+          this.raycaster.set(r.prevPos, segDir);
+          this.raycaster.near = 0;
+          this.raycaster.far = stepLen + 0.001;
+          const hits = this.raycaster.intersectObjects(entityTargets, false);
           for (let h = 0; h < hits.length; h++)
           {
             const ud = hits[h].object && hits[h].object.userData ? hits[h].object.userData : null;
-            if (ud && ud.isProjectile) continue;
-            detonateAt = hits[h].point.clone();
-            const enemyRef = ud ? ud.enemyRef : null;
-            if (enemyRef && enemyRef.alive)
-            {
-              hitEnemy = enemyRef;
-            }
-            else if (ud && ud.peerId)
-            {
-              hitPeerId = ud.peerId;
-            }
+            if (ud && ud.isProjectile) continue; // defence-in-depth
+            firstEntityHit = hits[h];
             break;
           }
+        }
+
+        const wallDist   = wallHit        ? wallHit.distance        : Infinity;
+        const entityDist = firstEntityHit ? firstEntityHit.distance : Infinity;
+
+        if (firstEntityHit && entityDist <= wallDist)
+        {
+          detonateAt = firstEntityHit.point.clone();
+          const ud = firstEntityHit.object && firstEntityHit.object.userData ? firstEntityHit.object.userData : null;
+          const enemyRef = ud ? ud.enemyRef : null;
+          if (enemyRef && enemyRef.alive)
+          {
+            hitEnemy = enemyRef;
+          }
+          else if (ud && ud.peerId)
+          {
+            hitPeerId = ud.peerId;
+          }
+        }
+        else if (wallHit)
+        {
+          detonateAt = wallHit.point.clone();
         }
       }
 
@@ -1633,9 +1667,15 @@ window.Game.Weapon = class
     let worldNormal = null;
     if (faceNormal && hitObject)
     {
+      // Mesh-space face normal -> world space.
       worldNormal = faceNormal.clone();
       const nm = new THREE.Matrix3().getNormalMatrix(hitObject.matrixWorld);
       worldNormal.applyMatrix3(nm).normalize();
+    }
+    else if (faceNormal)
+    {
+      // World-space normal already supplied (e.g. from level.raycastColliders).
+      worldNormal = faceNormal.clone().normalize();
     }
     else
     {
@@ -1836,7 +1876,8 @@ window.Game.Weapon = class
     const right = new THREE.Vector3().crossVectors(baseDir, upRef).normalize();
     const up    = new THREE.Vector3().crossVectors(right, baseDir).normalize();
 
-    const targets = this._gatherTargets(ctx);
+    const entityTargets = this._gatherEntityTargets(ctx);
+    const hasLevelSweep = !!(ctx && ctx.level && typeof ctx.level.raycastColliders === 'function');
     const muzzlePos = new THREE.Vector3();
     this._shotgunMuzzle.getWorldPosition(muzzlePos);
 
@@ -1856,34 +1897,52 @@ window.Game.Weapon = class
         .add(up.clone().multiplyScalar(oy))
         .normalize();
 
-      this.raycaster.set(this._origin, dir);
-      this.raycaster.near = 0;
-      this.raycaster.far = this.shotgun.maxRange;
-      const hits = this.raycaster.intersectObjects(targets, false);
+      // Wall hit (fast Box3 sweep) per pellet.
+      const wallHit = hasLevelSweep
+        ? ctx.level.raycastColliders(this._origin, dir, this.shotgun.maxRange)
+        : null;
+
+      // Entity hit per pellet.
+      let entityHit = null;
+      if (entityTargets.length > 0)
+      {
+        this.raycaster.set(this._origin, dir);
+        this.raycaster.near = 0;
+        this.raycaster.far = this.shotgun.maxRange;
+        const hits = this.raycaster.intersectObjects(entityTargets, false);
+        if (hits.length > 0) entityHit = hits[0];
+      }
 
       let hitPoint = null;
-      if (hits.length > 0)
+      const wallDist   = wallHit   ? wallHit.distance   : Infinity;
+      const entityDist = entityHit ? entityHit.distance : Infinity;
+
+      if (entityHit && entityDist <= wallDist)
       {
-        const h = hits[0];
-        hitPoint = h.point;
-        const ud = h.object && h.object.userData ? h.object.userData : null;
+        hitPoint = entityHit.point;
+        const ud = entityHit.object && entityHit.object.userData ? entityHit.object.userData : null;
         const enemyRef = ud ? ud.enemyRef : null;
         const peerId   = ud ? ud.peerId   : null;
 
         if (enemyRef && enemyRef.alive && typeof enemyRef.takeDamage === 'function')
         {
-          try { enemyRef.takeDamage(this.shotgun.damage, h.point); } catch (e) { /* ignore */ }
-          this._spawnBlood(h.point);
+          try { enemyRef.takeDamage(this.shotgun.damage, entityHit.point); } catch (e) { /* ignore */ }
+          this._spawnBlood(entityHit.point);
         }
         else if (peerId && ctx && ctx.network && typeof ctx.network.sendHit === 'function')
         {
           try { ctx.network.sendHit(peerId, this.shotgun.damage); } catch (e) { /* ignore */ }
-          this._spawnBlood(h.point);
+          this._spawnBlood(entityHit.point);
         }
         else
         {
-          this._spawnImpact(h.point, h.face ? h.face.normal : null, h.object);
+          this._spawnImpact(entityHit.point, entityHit.face ? entityHit.face.normal : null, entityHit.object);
         }
+      }
+      else if (wallHit)
+      {
+        hitPoint = wallHit.point;
+        this._spawnImpact(wallHit.point, wallHit.normal, null);
       }
 
       const tracerEnd = hitPoint
@@ -2056,41 +2115,59 @@ window.Game.Weapon = class
 
       if (stepLen > 1e-6)
       {
-        const targets = this._gatherTargets(ctx);
         const segDir = this._tmpVec.copy(g.pos).sub(g.prevPos).normalize();
-        this.raycaster.set(g.prevPos, segDir);
-        this.raycaster.near = 0;
-        this.raycaster.far = stepLen + 0.001;
-        const hits = this.raycaster.intersectObjects(targets, false);
-        for (let h = 0; h < hits.length; h++)
-        {
-          const ud = hits[h].object && hits[h].object.userData ? hits[h].object.userData : null;
-          if (ud && ud.isProjectile) continue;
 
+        // Wall hit via fast Box3 sweep.
+        const wallHit = (ctx && ctx.level && typeof ctx.level.raycastColliders === 'function')
+          ? ctx.level.raycastColliders(g.prevPos, segDir, stepLen + 0.001)
+          : null;
+
+        // Entity hit via Raycaster against the (small) entity list.
+        const entityTargets = this._gatherEntityTargets(ctx);
+        let firstEntityHit = null;
+        if (entityTargets.length > 0)
+        {
+          this.raycaster.set(g.prevPos, segDir);
+          this.raycaster.near = 0;
+          this.raycaster.far = stepLen + 0.001;
+          const hits = this.raycaster.intersectObjects(entityTargets, false);
+          for (let h = 0; h < hits.length; h++)
+          {
+            const ud = hits[h].object && hits[h].object.userData ? hits[h].object.userData : null;
+            if (ud && ud.isProjectile) continue; // defence-in-depth
+            firstEntityHit = hits[h];
+            break;
+          }
+        }
+
+        const wallDist   = wallHit        ? wallHit.distance        : Infinity;
+        const entityDist = firstEntityHit ? firstEntityHit.distance : Infinity;
+
+        if (firstEntityHit && entityDist <= wallDist)
+        {
+          // Direct contact with enemy or peer -> detonate immediately.
+          const ud = firstEntityHit.object && firstEntityHit.object.userData ? firstEntityHit.object.userData : null;
           const enemyRef = ud ? ud.enemyRef : null;
           const peerId   = ud ? ud.peerId   : null;
-
           if (enemyRef && enemyRef.alive)
           {
-            // Direct contact with enemy -> detonate immediately
-            detonateAt = hits[h].point.clone();
+            detonateAt = firstEntityHit.point.clone();
             hitEnemy = enemyRef;
           }
           else if (peerId)
           {
-            // Direct contact with remote player -> detonate immediately
-            detonateAt = hits[h].point.clone();
+            detonateAt = firstEntityHit.point.clone();
             hitPeerId = peerId;
           }
           else
           {
-            // Wall/floor -> bounce (or detonate if bounces exhausted)
-            bounceAt = hits[h].point.clone();
-            // Compute world-space normal from face normal
-            if (hits[h].face && hits[h].object)
+            // Mesh w/o enemy or peer userData (shouldn't normally happen with
+            // entity-only targets, but be safe): treat as a bounce surface.
+            bounceAt = firstEntityHit.point.clone();
+            if (firstEntityHit.face && firstEntityHit.object)
             {
-              bounceNormal = hits[h].face.normal.clone();
-              const nm = new THREE.Matrix3().getNormalMatrix(hits[h].object.matrixWorld);
+              bounceNormal = firstEntityHit.face.normal.clone();
+              const nm = new THREE.Matrix3().getNormalMatrix(firstEntityHit.object.matrixWorld);
               bounceNormal.applyMatrix3(nm).normalize();
             }
             else
@@ -2098,7 +2175,12 @@ window.Game.Weapon = class
               bounceNormal = segDir.clone().multiplyScalar(-1);
             }
           }
-          break;
+        }
+        else if (wallHit)
+        {
+          // Wall/floor -> bounce (or detonate if bounces exhausted).
+          bounceAt = wallHit.point.clone();
+          bounceNormal = wallHit.normal.clone().normalize();
         }
       }
 
