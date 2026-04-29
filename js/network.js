@@ -65,6 +65,14 @@
     });
   }
 
+  // Shared geometries across all remote players (perf): all peers reuse the
+  // same Box3 buffers — only their per-peer materials (HSL-tinted) are
+  // cloned. Disposal of remote players (_disposeRemote) skips these.
+  const SHARED_TORSO_GEOM = new THREE.BoxGeometry(0.6, 1.0, 0.35);
+  const SHARED_HEAD_GEOM  = new THREE.BoxGeometry(0.4, 0.4, 0.4);
+  const SHARED_ARM_GEOM   = new THREE.BoxGeometry(0.18, 0.9, 0.18);
+  const SHARED_LEG_GEOM   = new THREE.BoxGeometry(0.22, 0.85, 0.25);
+
   function buildRemotePlayerMesh(id, name) {
     const group = new THREE.Group();
     group.name = 'remote-player-' + id;
@@ -78,30 +86,28 @@
     const armMat = new THREE.MeshLambertMaterial({ color: baseColor });
 
     // Torso (centered roughly at chest height ~0.9m above feet)
-    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.6, 1.0, 0.35), torsoMat);
+    const torso = new THREE.Mesh(SHARED_TORSO_GEOM, torsoMat);
     torso.position.set(0, 0.9, 0);
     group.add(torso);
 
     // Head
-    const head = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.4, 0.4), headMat);
+    const head = new THREE.Mesh(SHARED_HEAD_GEOM, headMat);
     head.position.set(0, 1.65, 0);
     group.add(head);
 
     // Arms
-    const armGeom = new THREE.BoxGeometry(0.18, 0.9, 0.18);
-    const leftArm = new THREE.Mesh(armGeom, armMat);
+    const leftArm = new THREE.Mesh(SHARED_ARM_GEOM, armMat);
     leftArm.position.set(-0.4, 0.9, 0);
     group.add(leftArm);
-    const rightArm = new THREE.Mesh(armGeom, armMat);
+    const rightArm = new THREE.Mesh(SHARED_ARM_GEOM, armMat);
     rightArm.position.set(0.4, 0.9, 0);
     group.add(rightArm);
 
     // Legs (simple)
-    const legGeom = new THREE.BoxGeometry(0.22, 0.85, 0.25);
-    const leftLeg = new THREE.Mesh(legGeom, armMat);
+    const leftLeg = new THREE.Mesh(SHARED_LEG_GEOM, armMat);
     leftLeg.position.set(-0.16, 0.0, 0);
     group.add(leftLeg);
-    const rightLeg = new THREE.Mesh(legGeom, armMat);
+    const rightLeg = new THREE.Mesh(SHARED_LEG_GEOM, armMat);
     rightLeg.position.set(0.16, 0.0, 0);
     group.add(rightLeg);
 
@@ -298,7 +304,14 @@
       this.scene.remove(remote.group);
       remote.group.traverse((obj) => {
         if (obj.isMesh) {
-          if (obj.geometry) obj.geometry.dispose();
+          // Skip shared body geometries (re-used across all remote players).
+          if (obj.geometry &&
+              obj.geometry !== SHARED_TORSO_GEOM &&
+              obj.geometry !== SHARED_HEAD_GEOM &&
+              obj.geometry !== SHARED_ARM_GEOM &&
+              obj.geometry !== SHARED_LEG_GEOM) {
+            obj.geometry.dispose();
+          }
           if (obj.material) {
             if (obj.material.map) obj.material.map.dispose();
             obj.material.dispose();

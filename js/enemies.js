@@ -158,6 +158,42 @@ window.Game = window.Game || {};
       this._enemyEye = new THREE.Vector3();
       this._rayDir = new THREE.Vector3();
       this._tmpVec = new THREE.Vector3();
+      this._losRay = new THREE.Ray();
+      this._losHit = new THREE.Vector3();
+    }
+
+    // Cheap LOS: tests whether the segment from `from` (eye) toward `dir`
+    // (unit vector, length `len`) is blocked by any collider AABB. Uses
+    // level.colliders[] (Box3[]) — far cheaper than raycasting the
+    // InstancedMesh wall set, which iterates every instance per call.
+    // Falls back to level.raycastWalls if colliders aren't available.
+    _losBlocked(level, from, dir, len)
+    {
+      if (!level) return false;
+      if (Array.isArray(level.colliders) && level.colliders.length > 0)
+      {
+        this._losRay.origin.copy(from);
+        this._losRay.direction.copy(dir);
+        const cols = level.colliders;
+        for (let i = 0; i < cols.length; i++)
+        {
+          const hit = this._losRay.intersectBox(cols[i], this._losHit);
+          if (!hit) continue;
+          // Hit point must be within the segment length to count as a block.
+          const dx = this._losHit.x - from.x;
+          const dy = this._losHit.y - from.y;
+          const dz = this._losHit.z - from.z;
+          const distSq = dx * dx + dy * dy + dz * dz;
+          if (distSq <= len * len) return true;
+        }
+        return false;
+      }
+      if (typeof level.raycastWalls === "function")
+      {
+        const hit = level.raycastWalls(from, dir, len);
+        return !!(hit && hit.distance < len - 0.05);
+      }
+      return false;
     }
 
     // Build the enemy's AABB into this._aabb at the given foot position.
@@ -211,7 +247,8 @@ window.Game = window.Game || {};
       const dzh = this._toPlayer.z;
       const horizDist = Math.sqrt(dxh * dxh + dzh * dzh);
 
-      // LOS raycast from enemy eye to player position
+      // LOS check from enemy eye to player position. Uses cheap AABB sweep
+      // against level.colliders[] (no InstancedMesh raycast).
       this._enemyEye.set(this.position.x, this.position.y + ENEMY_EYE_HEIGHT, this.position.z);
       this._rayDir.set(
         player.position.x - this._enemyEye.x,
@@ -220,10 +257,9 @@ window.Game = window.Game || {};
       );
       const rayLen = this._rayDir.length();
       let hasLOS = true;
-      if (rayLen > 1e-4 && typeof level.raycastWalls === "function") {
+      if (rayLen > 1e-4) {
         this._rayDir.multiplyScalar(1 / rayLen);
-        const hit = level.raycastWalls(this._enemyEye, this._rayDir, rayLen);
-        if (hit && hit.distance < rayLen - 0.05) {
+        if (this._losBlocked(level, this._enemyEye, this._rayDir, rayLen)) {
           hasLOS = false;
         }
       }

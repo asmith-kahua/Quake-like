@@ -133,6 +133,27 @@ window.Game.Weapon = class
     this._smokeTexture     = this._makeSmokeTexture();
     this._sparkTexture     = this._makeSparkTexture();
 
+    // ---- Shared geometries for transient effect sprites (perf) -----------
+    // Every transient effect (impact, blood, explosion sprite, spark, smoke
+    // puff) used to allocate its own PlaneGeometry. With explosions spawning
+    // 25 sparks each, that's a lot of GPU buffer churn. We now share one
+    // unit (1x1) plane and scale the mesh per-instance. _disposeFx
+    // accordingly skips geometry disposal for these effects.
+    this._unitPlaneGeom = new THREE.PlaneGeometry(1, 1);
+    // Shared 2-vertex line buffer geometries for tracers. We allocate a small
+    // pool and reuse them by overwriting the `position` attribute. Tracers
+    // have a fixed ttl of 0.06s so the pool just needs to be larger than the
+    // max number of in-flight tracers under reasonable fire rates.
+    this._tracerPoolSize = 32;
+    this._tracerPool = [];
+    this._tracerPoolIdx = 0;
+    for (let i = 0; i < this._tracerPoolSize; i++)
+    {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
+      this._tracerPool.push(g);
+    }
+
     // ---- Build viewmodels (parented to camera) ---------------------------
     // Rifle viewmodel
     this.rifleView = new THREE.Group();
@@ -1088,7 +1109,12 @@ window.Game.Weapon = class
     {
       fx.mesh.material.dispose();
     }
-    if (fx.mesh && fx.mesh.geometry && fx.mesh.geometry.dispose)
+    // Skip geometry disposal for shared resources (unit plane, pooled tracer
+    // line geometries, point lights). Per-instance geometries (e.g. rocket
+    // body cylinder/cone) are still allocated by their spawn paths and
+    // remain owners of their own geometries, but those are disposed in their
+    // dedicated cleanup paths (_updateRockets/_updateGrenades), not here.
+    if (fx.mesh && fx.mesh.geometry && fx.mesh.geometry.dispose && !fx.sharedGeom)
     {
       fx.mesh.geometry.dispose();
     }
@@ -1599,8 +1625,9 @@ window.Game.Weapon = class
       side: THREE.DoubleSide,
       opacity: 1,
     });
-    const geom = new THREE.PlaneGeometry(0.35, 0.35);
-    const mesh = new THREE.Mesh(geom, mat);
+    // Reuse the shared unit-plane geometry; size via mesh.scale (0.35).
+    const mesh = new THREE.Mesh(this._unitPlaneGeom, mat);
+    mesh.scale.set(0.35, 0.35, 1);
     mesh.renderOrder = 800;
 
     let worldNormal = null;
@@ -1621,7 +1648,8 @@ window.Game.Weapon = class
     mesh.rotation.z = Math.random() * Math.PI * 2;
 
     this.scene.add(mesh);
-    this._addEffect({ mesh, t: 0, ttl: 0.5, kind: 'impact', startScale: 1 });
+    // startScale 0.35 = original PlaneGeometry(0.35,0.35) size with unit-plane share.
+    this._addEffect({ mesh, t: 0, ttl: 0.5, kind: 'impact', startScale: 0.35, sharedGeom: true });
   }
 
   _spawnBlood(point)
@@ -1636,8 +1664,9 @@ window.Game.Weapon = class
       opacity: 1,
       color: 0xff6655,
     });
-    const geom = new THREE.PlaneGeometry(0.4, 0.4);
-    const mesh = new THREE.Mesh(geom, mat);
+    // Reuse shared unit-plane geometry; original size 0.4 emulated via startScale.
+    const mesh = new THREE.Mesh(this._unitPlaneGeom, mat);
+    mesh.scale.set(0.4, 0.4, 1);
     mesh.renderOrder = 800;
     mesh.position.copy(point);
     const camPos = this.camera.getWorldPosition(this._tmpVec).clone();
@@ -1645,20 +1674,21 @@ window.Game.Weapon = class
     mesh.rotation.z = Math.random() * Math.PI * 2;
 
     this.scene.add(mesh);
-    this._addEffect({ mesh, t: 0, ttl: 0.4, kind: 'blood', startScale: 1 });
+    this._addEffect({ mesh, t: 0, ttl: 0.4, kind: 'blood', startScale: 0.4, sharedGeom: true });
   }
 
   _spawnTracer(endPoint)
   {
-    const muzzlePos = new THREE.Vector3();
+    const muzzlePos = this._tmpVec2;
     this._muzzleEnd.getWorldPosition(muzzlePos);
 
-    const positions = new Float32Array([
-      muzzlePos.x, muzzlePos.y, muzzlePos.z,
-      endPoint.x,  endPoint.y,  endPoint.z,
-    ]);
-    const geom = new THREE.BufferGeometry();
-    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    // Pull a pooled line geometry and overwrite its 2-vertex position buffer.
+    const geom = this._tracerPool[this._tracerPoolIdx];
+    this._tracerPoolIdx = (this._tracerPoolIdx + 1) % this._tracerPoolSize;
+    const arr = geom.attributes.position.array;
+    arr[0] = muzzlePos.x; arr[1] = muzzlePos.y; arr[2] = muzzlePos.z;
+    arr[3] = endPoint.x;  arr[4] = endPoint.y;  arr[5] = endPoint.z;
+    geom.attributes.position.needsUpdate = true;
 
     const mat = new THREE.LineBasicMaterial({
       color: 0xfff0c0,
@@ -1670,8 +1700,9 @@ window.Game.Weapon = class
     });
     const line = new THREE.Line(geom, mat);
     line.renderOrder = 800;
+    line.frustumCulled = false; // bounds aren't updated since we share the buffer
     this.scene.add(line);
-    this._addEffect({ mesh: line, t: 0, ttl: 0.06, kind: 'tracer' });
+    this._addEffect({ mesh: line, t: 0, ttl: 0.06, kind: 'tracer', sharedGeom: true });
   }
 
   _spawnExplosionSprite(point)
@@ -1685,15 +1716,14 @@ window.Game.Weapon = class
       side: THREE.DoubleSide,
       opacity: 1,
     });
-    // Use a unit plane and scale it via update.
-    const geom = new THREE.PlaneGeometry(1, 1);
-    const mesh = new THREE.Mesh(geom, mat);
+    // Reuse the shared unit-plane geometry; explosion update sets scale per-frame.
+    const mesh = new THREE.Mesh(this._unitPlaneGeom, mat);
     mesh.renderOrder = 850;
     mesh.position.copy(point);
     mesh.scale.setScalar(0.5);
 
     this.scene.add(mesh);
-    this._addEffect({ mesh, t: 0, ttl: 0.55, kind: 'explosion' });
+    this._addEffect({ mesh, t: 0, ttl: 0.55, kind: 'explosion', sharedGeom: true });
   }
 
   _spawnExplosionParticles(point)
@@ -1711,9 +1741,10 @@ window.Game.Weapon = class
         opacity: 1,
         color: i < count * 0.6 ? 0xffaa44 : 0xffe080,
       });
+      // Reuse shared unit-plane; original per-spark size becomes startScale.
       const size = 0.15 + Math.random() * 0.15;
-      const geom = new THREE.PlaneGeometry(size, size);
-      const mesh = new THREE.Mesh(geom, mat);
+      const mesh = new THREE.Mesh(this._unitPlaneGeom, mat);
+      mesh.scale.set(size, size, 1);
       mesh.renderOrder = 850;
       mesh.position.copy(point);
 
@@ -1731,7 +1762,8 @@ window.Game.Weapon = class
         t: 0,
         ttl: 0.45 + Math.random() * 0.2,
         kind: 'spark',
-        startScale: 1,
+        startScale: size,
+        sharedGeom: true,
         vel: new THREE.Vector3(vx, vy, vz),
       });
     }
@@ -1763,9 +1795,10 @@ window.Game.Weapon = class
       opacity: 0.6,
       color: 0xffaa66,
     });
+    // Reuse shared unit-plane; size becomes startScale.
     const size = 0.25 + Math.random() * 0.15;
-    const geom = new THREE.PlaneGeometry(size, size);
-    const mesh = new THREE.Mesh(geom, mat);
+    const mesh = new THREE.Mesh(this._unitPlaneGeom, mat);
+    mesh.scale.set(size, size, 1);
     mesh.renderOrder = 820;
     mesh.position.copy(pos);
     mesh.position.x += (Math.random() - 0.5) * 0.05;
@@ -1778,7 +1811,8 @@ window.Game.Weapon = class
       t: 0,
       ttl: 0.45,
       kind: 'smoke',
-      startScale: 1,
+      startScale: size,
+      sharedGeom: true,
     });
   }
 
@@ -1868,12 +1902,12 @@ window.Game.Weapon = class
   // Thin tracer line from muzzle to (per-pellet) end point.
   _spawnPelletTracer(muzzlePos, endPoint)
   {
-    const positions = new Float32Array([
-      muzzlePos.x, muzzlePos.y, muzzlePos.z,
-      endPoint.x,  endPoint.y,  endPoint.z,
-    ]);
-    const geom = new THREE.BufferGeometry();
-    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    const geom = this._tracerPool[this._tracerPoolIdx];
+    this._tracerPoolIdx = (this._tracerPoolIdx + 1) % this._tracerPoolSize;
+    const arr = geom.attributes.position.array;
+    arr[0] = muzzlePos.x; arr[1] = muzzlePos.y; arr[2] = muzzlePos.z;
+    arr[3] = endPoint.x;  arr[4] = endPoint.y;  arr[5] = endPoint.z;
+    geom.attributes.position.needsUpdate = true;
 
     const mat = new THREE.LineBasicMaterial({
       color: 0xffe6a0,
@@ -1885,8 +1919,9 @@ window.Game.Weapon = class
     });
     const line = new THREE.Line(geom, mat);
     line.renderOrder = 800;
+    line.frustumCulled = false;
     this.scene.add(line);
-    this._addEffect({ mesh: line, t: 0, ttl: 0.06, kind: 'tracer' });
+    this._addEffect({ mesh: line, t: 0, ttl: 0.06, kind: 'tracer', sharedGeom: true });
   }
 
   // -------------------------------------------------------------------------
