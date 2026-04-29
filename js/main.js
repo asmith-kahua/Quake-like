@@ -294,22 +294,38 @@
     }
   }
 
+  // Pool of 2-vertex line geometries reused across remote tracers (same
+  // pattern as weapons.js _tracerPool — avoids a new BufferGeometry alloc
+  // per remote shot). Marked _shared so tickRemoteEffects skips disposal.
+  const REMOTE_TRACER_POOL_SIZE = 16;
+  const remoteTracerPool = [];
+  let   remoteTracerPoolIdx = 0;
+  for (let i = 0; i < REMOTE_TRACER_POOL_SIZE; i++) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3));
+    remoteTracerPool.push(g);
+  }
+
   function spawnRemoteShoot(payload) {
     const o = payload.origin, d = payload.dir;
     if (!o || !d) return;
-    const start = new THREE.Vector3(o[0], o[1], o[2]);
-    const end   = start.clone().add(new THREE.Vector3(d[0], d[1], d[2]).multiplyScalar(40));
-    const positions = new Float32Array([start.x, start.y, start.z, end.x, end.y, end.z]);
-    const geom = new THREE.BufferGeometry();
-    geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    const sx = o[0], sy = o[1], sz = o[2];
+    const ex = sx + d[0] * 40, ey = sy + d[1] * 40, ez = sz + d[2] * 40;
+    const geom = remoteTracerPool[remoteTracerPoolIdx];
+    remoteTracerPoolIdx = (remoteTracerPoolIdx + 1) % REMOTE_TRACER_POOL_SIZE;
+    const arr = geom.attributes.position.array;
+    arr[0] = sx; arr[1] = sy; arr[2] = sz;
+    arr[3] = ex; arr[4] = ey; arr[5] = ez;
+    geom.attributes.position.needsUpdate = true;
     const mat = new THREE.LineBasicMaterial({
       color: 0xfff0c0, transparent: true, opacity: 0.85,
       blending: THREE.AdditiveBlending, depthTest: true, depthWrite: false
     });
     const line = new THREE.Line(geom, mat);
+    line.frustumCulled = false; // shared pool geom — bounds not updated
     scene.add(line);
-    remoteEffects.push({ mesh: line, t: 0, ttl: 0.08 });
-    sound.play("rifleShot", { volume: 0.6, position: [start.x, start.y, start.z] });
+    remoteEffects.push({ mesh: line, t: 0, ttl: 0.08, _sharedGeom: true });
+    sound.play("rifleShot", { volume: 0.6, position: [sx, sy, sz] });
   }
 
   function spawnRemoteExplosion(payload) {
@@ -340,7 +356,8 @@
       if (fx.t >= fx.ttl) {
         if (fx.mesh.parent) fx.mesh.parent.remove(fx.mesh);
         if (fx.mesh.material) fx.mesh.material.dispose && fx.mesh.material.dispose();
-        if (fx.mesh.geometry) fx.mesh.geometry.dispose && fx.mesh.geometry.dispose();
+        // Skip geometry disposal for pooled (shared) tracer geometries.
+        if (!fx._sharedGeom && fx.mesh.geometry) fx.mesh.geometry.dispose && fx.mesh.geometry.dispose();
         remoteEffects.splice(i, 1);
         continue;
       }
@@ -962,18 +979,27 @@
   }
 
   // ---------- Camera shake ----------
+  // _shakeOffset is the *current* shake offset applied to camera.position; it
+  // smoothly chases _shakeTarget (a fresh random per-frame target) so we don't
+  // strobe a raw random offset at 60Hz (which produces a visible camera jitter
+  // / "jump" feel even at low intensities). Lerp factor 0.5 settles toward the
+  // new target in ~2-3 frames while still feeling sharp.
   const _shakeOffset = new THREE.Vector3();
+  const _shakeTarget = new THREE.Vector3();
   function applyCameraShake(dt) {
     const cs = weapon.cameraShake;
     if (!cs || cs.intensity <= 0.001) {
+      // Reset offset so we start from zero on the next active shake (no carry-over).
+      _shakeOffset.set(0, 0, 0);
       return;
     }
     const i = cs.intensity * 0.18;
-    _shakeOffset.set(
+    _shakeTarget.set(
       (Math.random() - 0.5) * i,
       (Math.random() - 0.5) * i,
       (Math.random() - 0.5) * i * 0.5
     );
+    _shakeOffset.lerp(_shakeTarget, 0.5);
     camera.position.add(_shakeOffset);
   }
 

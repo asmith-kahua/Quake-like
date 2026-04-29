@@ -249,6 +249,45 @@ window.Game = window.Game || {};
       this._tmpVec2 = new THREE.Vector3();
       this._lastPlayerPos = new THREE.Vector3();
       this._hasLastPlayerPos = false;
+      this._losRay = new THREE.Ray();
+      this._losHit = new THREE.Vector3();
+      // Reusable scratch for _fireProjectile so we don't alloc Vec3s per shot.
+      this._fpOrigin = new THREE.Vector3();
+      this._fpAim    = new THREE.Vector3();
+      this._fpDir    = new THREE.Vector3();
+    }
+
+    // Cheap LOS / wall-hit test against level.colliders[] (Box3[]). Returns
+    // hit distance along the ray (>=0), or -1 if no hit within `len`. Far
+    // cheaper than raycasting InstancedMesh walls every frame.
+    _losDistance(level, from, dir, len)
+    {
+      if (!level) return -1;
+      if (Array.isArray(level.colliders) && level.colliders.length > 0)
+      {
+        this._losRay.origin.copy(from);
+        this._losRay.direction.copy(dir);
+        const cols = level.colliders;
+        let bestSq = -1;
+        for (let i = 0; i < cols.length; i++)
+        {
+          const hit = this._losRay.intersectBox(cols[i], this._losHit);
+          if (!hit) continue;
+          const dx = this._losHit.x - from.x;
+          const dy = this._losHit.y - from.y;
+          const dz = this._losHit.z - from.z;
+          const dSq = dx * dx + dy * dy + dz * dz;
+          if (dSq > len * len) continue;
+          if (bestSq < 0 || dSq < bestSq) bestSq = dSq;
+        }
+        return bestSq < 0 ? -1 : Math.sqrt(bestSq);
+      }
+      if (typeof level.raycastWalls === "function")
+      {
+        const hit = level.raycastWalls(from, dir, len);
+        return (hit && hit.distance <= len) ? hit.distance : -1;
+      }
+      return -1;
     }
 
     _buildAABB(pos) {
@@ -306,10 +345,10 @@ window.Game = window.Game || {};
       );
       const rayLen = this._rayDir.length();
       let hasLOS = true;
-      if (rayLen > 1e-4 && typeof level.raycastWalls === "function") {
+      if (rayLen > 1e-4) {
         this._rayDir.multiplyScalar(1 / rayLen);
-        const hit = level.raycastWalls(this._botEye, this._rayDir, rayLen);
-        if (hit && hit.distance < rayLen - 0.05) {
+        const dHit = this._losDistance(level, this._botEye, this._rayDir, rayLen);
+        if (dHit >= 0 && dHit < rayLen - 0.05) {
           hasLOS = false;
         }
       }
@@ -447,15 +486,15 @@ window.Game = window.Game || {};
     }
 
     _fireProjectile(player, dt) {
-      // Origin: roughly the bot's chest, slightly forward.
-      const origin = new THREE.Vector3(
+      // Origin: roughly the bot's chest, slightly forward. (Reused scratch.)
+      const origin = this._fpOrigin.set(
         this.position.x,
         this.position.y + 1.3,
         this.position.z
       );
 
-      // Aim point: player center (~ eye - 0.85)
-      const aim = new THREE.Vector3(
+      // Aim point: player center (~ eye - 0.85). (Reused scratch.)
+      const aim = this._fpAim.set(
         player.position.x,
         player.position.y - 0.85,
         player.position.z
@@ -479,7 +518,7 @@ window.Game = window.Game || {};
         }
       }
 
-      const dir = new THREE.Vector3().subVectors(aim, origin);
+      const dir = this._fpDir.subVectors(aim, origin);
       const dlen = dir.length();
       if (dlen < 1e-4) return;
       dir.multiplyScalar(1 / dlen);
@@ -525,20 +564,18 @@ window.Game = window.Game || {};
 
         const stepDist = p.speed * dt;
 
-        // Wall raycast for this step
+        // Wall hit for this step. Use cheap AABB sweep against level.colliders[]
+        // instead of raycasting InstancedMesh walls every frame.
         let blocked = false;
-        if (level && typeof level.raycastWalls === "function") {
-          const hit = level.raycastWalls(p.pos, p.dir, stepDist + 0.1);
-          if (hit && hit.distance <= stepDist + 0.05) {
-            // Hit wall — stop here
-            p.pos.x += p.dir.x * hit.distance;
-            p.pos.y += p.dir.y * hit.distance;
-            p.pos.z += p.dir.z * hit.distance;
-            p.mesh.position.copy(p.pos);
-            this._destroyProjectile(p);
-            this._projectiles.splice(i, 1);
-            blocked = true;
-          }
+        const wallDist = this._losDistance(level, p.pos, p.dir, stepDist + 0.1);
+        if (wallDist >= 0 && wallDist <= stepDist + 0.05) {
+          p.pos.x += p.dir.x * wallDist;
+          p.pos.y += p.dir.y * wallDist;
+          p.pos.z += p.dir.z * wallDist;
+          p.mesh.position.copy(p.pos);
+          this._destroyProjectile(p);
+          this._projectiles.splice(i, 1);
+          blocked = true;
         }
         if (blocked) continue;
 

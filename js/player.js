@@ -105,8 +105,17 @@ window.Game.Player = class {
     if (this.dead) {
       return;
     }
-    const dx = event.movementX || 0;
-    const dy = event.movementY || 0;
+    // Clamp single-frame mouse movement to absorb the Chrome pointer-lock
+    // spike on Windows (event.movementX/Y can briefly fire absurd values
+    // — hundreds or thousands — when pointer lock is acquired or after
+    // tab/focus changes), which otherwise produces a jarring camera jump.
+    let dx = event.movementX || 0;
+    let dy = event.movementY || 0;
+    const MAX_DELTA = 15;
+    if (dx >  MAX_DELTA) dx =  MAX_DELTA;
+    else if (dx < -MAX_DELTA) dx = -MAX_DELTA;
+    if (dy >  MAX_DELTA) dy =  MAX_DELTA;
+    else if (dy < -MAX_DELTA) dy = -MAX_DELTA;
     this.yaw   -= dx * this.mouseSensitivity;
     this.pitch -= dy * this.mouseSensitivity;
     this.pitch = THREE.MathUtils.clamp(this.pitch, -this.pitchLimit, this.pitchLimit);
