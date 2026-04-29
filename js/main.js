@@ -330,11 +330,31 @@
     return g;
   }
 
+  // Dispose every Mesh under a pickup group: the geom and material are
+  // unique per pickup (not shared), so leaving them undisposed across map
+  // swaps would leak GPU buffers. The helper traverses the group and frees
+  // every owned resource. Used by clearMpPickups + clearSoloPickups.
+  function disposePickupGroup(group) {
+    if (!group) return;
+    if (group.parent) group.parent.remove(group);
+    if (typeof group.traverse !== "function") return;
+    group.traverse((obj) => {
+      if (obj.isMesh) {
+        if (obj.geometry && obj.geometry.dispose) obj.geometry.dispose();
+        if (obj.material) {
+          const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+          for (let m = 0; m < mats.length; m++) {
+            if (mats[m] && mats[m].dispose) mats[m].dispose();
+          }
+        }
+      }
+    });
+  }
+
   function clearMpPickups() {
     for (const arr of [mpRocketPickups, mpShotgunPickups]) {
       for (let i = 0; i < arr.length; i++) {
-        const p = arr[i];
-        if (p.mesh && p.mesh.parent) p.mesh.parent.remove(p.mesh);
+        disposePickupGroup(arr[i].mesh);
       }
       arr.length = 0;
     }
@@ -345,8 +365,7 @@
   function clearSoloPickups() {
     for (const arr of [soloRiflePickups, soloRocketPickups, soloShotgunPickups]) {
       for (let i = 0; i < arr.length; i++) {
-        const p = arr[i];
-        if (p.mesh && p.mesh.parent) p.mesh.parent.remove(p.mesh);
+        disposePickupGroup(arr[i].mesh);
       }
       arr.length = 0;
     }
@@ -513,6 +532,48 @@
     remoteTracerPool.push(g);
   }
 
+  // Pool of LineBasicMaterials reused across remote tracers. Same opacity-
+  // mutation collision concerns as weapons.js: pool size >= max simultaneous
+  // in-flight remote tracers (TTL 0.08s @ ~20Hz peer fire = ~2 active per peer).
+  const REMOTE_TRACER_MAT_POOL_SIZE = 16;
+  const remoteTracerMatPool = [];
+  let   remoteTracerMatPoolIdx = 0;
+  for (let i = 0; i < REMOTE_TRACER_MAT_POOL_SIZE; i++) {
+    remoteTracerMatPool.push(new THREE.LineBasicMaterial({
+      color: 0xfff0c0, transparent: true, opacity: 0.85,
+      blending: THREE.AdditiveBlending, depthTest: true, depthWrite: false
+    }));
+  }
+
+  // Pool of PointLights reused across remote explosions. Mirrors the local
+  // explosion-light pool in weapons.js. Free slots have intensity 0 and are
+  // hidden; tickRemoteEffects releases the slot when ttl expires.
+  const REMOTE_LIGHT_POOL_SIZE = 4;
+  const remoteLightPool = [];
+  for (let i = 0; i < REMOTE_LIGHT_POOL_SIZE; i++) {
+    const l = new THREE.PointLight(0xff7733, 0, 14, 2);
+    l.visible = false;
+    scene.add(l);
+    remoteLightPool.push({ light: l, inUse: false });
+  }
+  function acquireRemoteLight() {
+    for (let i = 0; i < remoteLightPool.length; i++) {
+      const slot = remoteLightPool[i];
+      if (!slot.inUse) {
+        slot.inUse = true;
+        slot.light.visible = true;
+        return slot;
+      }
+    }
+    return null;
+  }
+  function releaseRemoteLight(slot) {
+    if (!slot) return;
+    slot.inUse = false;
+    slot.light.intensity = 0;
+    slot.light.visible = false;
+  }
+
   function spawnRemoteShoot(payload) {
     const o = payload.origin, d = payload.dir;
     if (!o || !d) return;
@@ -524,28 +585,36 @@
     arr[0] = sx; arr[1] = sy; arr[2] = sz;
     arr[3] = ex; arr[4] = ey; arr[5] = ez;
     geom.attributes.position.needsUpdate = true;
-    const mat = new THREE.LineBasicMaterial({
-      color: 0xfff0c0, transparent: true, opacity: 0.85,
-      blending: THREE.AdditiveBlending, depthTest: true, depthWrite: false
-    });
+    const mat = remoteTracerMatPool[remoteTracerMatPoolIdx];
+    remoteTracerMatPoolIdx = (remoteTracerMatPoolIdx + 1) % REMOTE_TRACER_MAT_POOL_SIZE;
+    mat.opacity = 0.85;
     const line = new THREE.Line(geom, mat);
     line.frustumCulled = false; // shared pool geom — bounds not updated
     scene.add(line);
-    remoteEffects.push({ mesh: line, t: 0, ttl: 0.08, _sharedGeom: true });
+    remoteEffects.push({ mesh: line, t: 0, ttl: 0.08, _sharedGeom: true, _sharedMat: true });
     sound.play("rifleShot", { volume: 0.6, position: [sx, sy, sz] });
   }
 
   function spawnRemoteExplosion(payload) {
     const at = payload.at;
     if (!at) return;
-    const pos = new THREE.Vector3(at[0], at[1], at[2]);
-    const light = new THREE.PointLight(0xff7733, 5, 14, 2);
-    light.position.copy(pos);
-    scene.add(light);
-    remoteEffects.push({ mesh: light, t: 0, ttl: 0.3, kind: "light", initial: 5 });
-    sound.play("explosion", { volume: 0.9, position: [pos.x, pos.y, pos.z] });
-    // Camera shake based on proximity
-    const dist = pos.distanceTo(player.position);
+    const ax = at[0], ay = at[1], az = at[2];
+    const slot = acquireRemoteLight();
+    if (slot) {
+      slot.light.color.setHex(0xff7733);
+      slot.light.distance = 14;
+      slot.light.decay = 2;
+      slot.light.intensity = 5;
+      slot.light.position.set(ax, ay, az);
+      remoteEffects.push({ mesh: slot.light, _lightSlot: slot, t: 0, ttl: 0.3, kind: "light", initial: 5 });
+    }
+    sound.play("explosion", { volume: 0.9, position: [ax, ay, az] });
+    // Camera shake based on proximity (compute distance scalar without
+    // allocating a Vector3).
+    const dx = ax - player.position.x;
+    const dy = ay - player.position.y;
+    const dz = az - player.position.z;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
     if (dist < 18) {
       const inten = THREE.MathUtils.clamp(1.0 - dist / 18, 0, 1) * 0.6;
       if (weapon.cameraShake) {
@@ -561,10 +630,20 @@
       fx.t += dt;
       const k = 1 - fx.t / fx.ttl;
       if (fx.t >= fx.ttl) {
-        if (fx.mesh.parent) fx.mesh.parent.remove(fx.mesh);
-        if (fx.mesh.material) fx.mesh.material.dispose && fx.mesh.material.dispose();
+        // Release pooled point-lights back to the pool (don't remove from scene).
+        if (fx._lightSlot) {
+          releaseRemoteLight(fx._lightSlot);
+        } else if (fx.mesh && fx.mesh.parent) {
+          fx.mesh.parent.remove(fx.mesh);
+        }
+        // Skip material disposal for pooled (shared) materials.
+        if (!fx._sharedMat && !fx._lightSlot && fx.mesh && fx.mesh.material && fx.mesh.material.dispose) {
+          fx.mesh.material.dispose();
+        }
         // Skip geometry disposal for pooled (shared) tracer geometries.
-        if (!fx._sharedGeom && fx.mesh.geometry) fx.mesh.geometry.dispose && fx.mesh.geometry.dispose();
+        if (!fx._sharedGeom && fx.mesh && fx.mesh.geometry && fx.mesh.geometry.dispose) {
+          fx.mesh.geometry.dispose();
+        }
         remoteEffects.splice(i, 1);
         continue;
       }
@@ -673,9 +752,25 @@
       loadLevel(idx);
     } else {
       // Same map - just clear mobs + scatter pickups (no full reload).
+      // Same disposal contract as loadLevel() (per-bot mats + pooled lights).
       for (let i = 0; i < enemies.length; i++) {
-        const m = enemies[i].mesh;
+        const en = enemies[i];
+        const m = en && en.mesh;
         if (m && m.parent) m.parent.remove(m);
+        if (en && Array.isArray(en._allMats)) {
+          for (let mi = 0; mi < en._allMats.length; mi++) {
+            const mat = en._allMats[mi];
+            if (mat && typeof mat.dispose === "function") mat.dispose();
+          }
+        }
+        if (en && Array.isArray(en._lightPool)) {
+          for (let li = 0; li < en._lightPool.length; li++) {
+            const slot = en._lightPool[li];
+            if (slot && slot.light && slot.light.parent) {
+              slot.light.parent.remove(slot.light);
+            }
+          }
+        }
       }
       enemies = [];
       prevAlive = [];
@@ -778,10 +873,31 @@
       level.dispose();
     }
 
-    // Despawn existing enemies
+    // Despawn existing enemies. Bots use SHARED mesh geometries (defined as
+    // module-level singletons in bots.js) so we must NOT dispose those — but
+    // each bot has its own three Lambert materials (body/head/accent) for
+    // per-instance hit-flash, and those leak across map swaps unless we
+    // explicitly dispose them here.
     for (let i = 0; i < enemies.length; i++) {
-      const m = enemies[i].mesh;
+      const en = enemies[i];
+      const m = en && en.mesh;
       if (m && m.parent) m.parent.remove(m);
+      if (en && Array.isArray(en._allMats)) {
+        for (let mi = 0; mi < en._allMats.length; mi++) {
+          const mat = en._allMats[mi];
+          if (mat && typeof mat.dispose === "function") mat.dispose();
+        }
+      }
+      // Clean up any per-bot pooled lights so we don't leave hidden lights
+      // attached to the scene when the bot is despawned.
+      if (en && Array.isArray(en._lightPool)) {
+        for (let li = 0; li < en._lightPool.length; li++) {
+          const slot = en._lightPool[li];
+          if (slot && slot.light && slot.light.parent) {
+            slot.light.parent.remove(slot.light);
+          }
+        }
+      }
     }
 
     currentLevelIndex = THREE.MathUtils.clamp(index, 0, MAX_MAP_INDEX);
@@ -812,24 +928,37 @@
     ui.setKills(0, enemies.length);
     ui.message("LEVEL " + (currentLevelIndex + 1) + " — " + (level.levelName || ""), 2400);
 
-    // Sweep up in-flight rockets, weapon effects, remote effects from the prior level
-    if (weapon.rockets) {
+    // Sweep up in-flight rockets/grenades and weapon effects from the prior
+    // level. Both go through pooled-aware helpers so we don't accidentally
+    // dispose pool slots (the helpers release-back instead of disposing).
+    if (typeof weapon.clearProjectiles === "function") {
+      weapon.clearProjectiles();
+    } else if (weapon.rockets) {
+      // Fallback for older builds without the helper.
       for (let i = 0; i < weapon.rockets.length; i++) {
         const r = weapon.rockets[i];
         if (r && r.mesh && r.mesh.parent) r.mesh.parent.remove(r.mesh);
       }
       weapon.rockets.length = 0;
     }
-    if (weapon.effects) {
+    if (typeof weapon.clearEffects === "function") {
+      weapon.clearEffects();
+    } else if (weapon.effects) {
       for (let i = 0; i < weapon.effects.length; i++) {
         const fx = weapon.effects[i];
         if (fx && fx.mesh && fx.mesh.parent) fx.mesh.parent.remove(fx.mesh);
       }
       weapon.effects.length = 0;
     }
+    // Release pooled remote-effect lights back to the pool; remove tracer
+    // lines from the scene (shared geom + pooled mat — don't dispose).
     for (let i = 0; i < remoteEffects.length; i++) {
       const fx = remoteEffects[i];
-      if (fx.mesh && fx.mesh.parent) fx.mesh.parent.remove(fx.mesh);
+      if (fx._lightSlot) {
+        releaseRemoteLight(fx._lightSlot);
+      } else if (fx.mesh && fx.mesh.parent) {
+        fx.mesh.parent.remove(fx.mesh);
+      }
     }
     remoteEffects.length = 0;
 
