@@ -105,17 +105,17 @@ window.Game.Player = class {
     if (this.dead) {
       return;
     }
-    // Clamp single-frame mouse movement to absorb the Chrome pointer-lock
-    // spike on Windows (event.movementX/Y can briefly fire absurd values
-    // — hundreds or thousands — when pointer lock is acquired or after
-    // tab/focus changes), which otherwise produces a jarring camera jump.
+    // Discard single-frame mouse spikes from the Chrome pointer-lock bug on
+    // Windows (event.movementX/Y can briefly emit absurd values — hundreds or
+    // thousands — at lock acquire or after focus changes). Normal fast flicks
+    // peak around 100-150 pixels per event, so anything beyond 350 is almost
+    // certainly the spike. We zero those out instead of clamping so an
+    // accidental capped delta doesn't still rotate the camera noticeably.
     let dx = event.movementX || 0;
     let dy = event.movementY || 0;
-    const MAX_DELTA = 15;
-    if (dx >  MAX_DELTA) dx =  MAX_DELTA;
-    else if (dx < -MAX_DELTA) dx = -MAX_DELTA;
-    if (dy >  MAX_DELTA) dy =  MAX_DELTA;
-    else if (dy < -MAX_DELTA) dy = -MAX_DELTA;
+    const SPIKE_THRESHOLD = 350;
+    if (Math.abs(dx) > SPIKE_THRESHOLD) dx = 0;
+    if (Math.abs(dy) > SPIKE_THRESHOLD) dy = 0;
     this.yaw   -= dx * this.mouseSensitivity;
     this.pitch -= dy * this.mouseSensitivity;
     this.pitch = THREE.MathUtils.clamp(this.pitch, -this.pitchLimit, this.pitchLimit);
