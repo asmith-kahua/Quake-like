@@ -221,11 +221,15 @@
     health: 18,        // health crystals
     rocketLauncher: 22, // MP scattered rocket pickup + level 0 built-in
     soloRifle: 15,     // periodic rifle-ammo crates in solo
-    soloRocket: 40     // periodic rocket-ammo pickups in solo (longer cycle)
+    soloRocket: 40,    // periodic rocket pickup in solo (longer cycle)
+    soloShotgun: 25,   // periodic shotgun pickup in solo
+    mpShotgun: 22      // PvP shotgun pickup
   };
-  const mpRocketPickups = [];   // PvP-only scattered rockets
-  const soloRiflePickups = [];  // solo: rifle-ammo crates
-  const soloRocketPickups = []; // solo: rocket-ammo pickups
+  const mpRocketPickups = [];     // PvP-only scattered rocket
+  const mpShotgunPickups = [];    // PvP-only scattered shotgun
+  const soloRiflePickups = [];    // solo: rifle-ammo crates
+  const soloRocketPickups = [];   // solo: rocket pickup (one per level)
+  const soloShotgunPickups = [];  // solo: shotgun pickup (one per level)
 
   function makeRocketPickupMesh() {
     const g = new THREE.Group();
@@ -258,6 +262,51 @@
     return g;
   }
 
+  // Distinctive shotgun pickup — twin parallel barrels on a wood receiver
+  // floating over a brass-rimmed pedestal with a soft cyan glow.
+  function makeShotgunPickupMesh() {
+    const g = new THREE.Group();
+    g.userData.isPickup = true;
+    // Twin barrels (cylinders, side by side, slightly tilted up)
+    const barrelGeom = new THREE.CylinderGeometry(0.045, 0.045, 0.65, 8);
+    const barrelMat = new THREE.MeshStandardMaterial({
+      color: 0x202024, emissive: 0x0c0c10, emissiveIntensity: 0.4, roughness: 0.4, metalness: 0.7
+    });
+    const barrelL = new THREE.Mesh(barrelGeom, barrelMat);
+    barrelL.rotation.z = Math.PI / 2;
+    barrelL.position.set(0, 0.55, -0.05);
+    g.add(barrelL);
+    const barrelR = new THREE.Mesh(barrelGeom, barrelMat);
+    barrelR.rotation.z = Math.PI / 2;
+    barrelR.position.set(0, 0.55, 0.05);
+    g.add(barrelR);
+    // Wooden receiver/stock block
+    const stockMat = new THREE.MeshStandardMaterial({
+      color: 0x5a3a22, emissive: 0x1a0e06, emissiveIntensity: 0.3, roughness: 0.65
+    });
+    const stock = new THREE.Mesh(new THREE.BoxGeometry(0.20, 0.14, 0.18), stockMat);
+    stock.position.set(0.30, 0.55, 0);
+    g.add(stock);
+    // Brass receiver detail
+    const brass = new THREE.Mesh(
+      new THREE.BoxGeometry(0.04, 0.06, 0.20),
+      new THREE.MeshStandardMaterial({ color: 0xb08840, emissive: 0x442200, emissiveIntensity: 0.45, roughness: 0.4 })
+    );
+    brass.position.set(0.18, 0.58, 0);
+    g.add(brass);
+    // Pedestal
+    const ped = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.34, 0.38, 0.1, 12),
+      new THREE.MeshStandardMaterial({ color: 0x4a3020, roughness: 0.85 })
+    );
+    ped.position.y = 0.05;
+    g.add(ped);
+    const glow = new THREE.PointLight(0x66ddee, 0.6, 4, 2);
+    glow.position.y = 0.55;
+    g.add(glow);
+    return g;
+  }
+
   // Khaki ammo crate (rifle ammo).
   function makeRifleAmmoMesh() {
     const g = new THREE.Group();
@@ -284,16 +333,20 @@
     return g;
   }
 
-  function clearMpRocketPickups() {
-    for (let i = 0; i < mpRocketPickups.length; i++) {
-      const p = mpRocketPickups[i];
-      if (p.mesh && p.mesh.parent) p.mesh.parent.remove(p.mesh);
+  function clearMpPickups() {
+    for (const arr of [mpRocketPickups, mpShotgunPickups]) {
+      for (let i = 0; i < arr.length; i++) {
+        const p = arr[i];
+        if (p.mesh && p.mesh.parent) p.mesh.parent.remove(p.mesh);
+      }
+      arr.length = 0;
     }
-    mpRocketPickups.length = 0;
   }
+  // Back-compat alias (in case anything still calls the old name).
+  const clearMpRocketPickups = clearMpPickups;
 
   function clearSoloPickups() {
-    for (const arr of [soloRiflePickups, soloRocketPickups]) {
+    for (const arr of [soloRiflePickups, soloRocketPickups, soloShotgunPickups]) {
       for (let i = 0; i < arr.length; i++) {
         const p = arr[i];
         if (p.mesh && p.mesh.parent) p.mesh.parent.remove(p.mesh);
@@ -322,10 +375,13 @@
       const j = Math.floor(Math.random() * (i + 1));
       const tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
     }
-    // ~3 rifle ammo crates, ~1-2 rocket pickups, scaled to slot availability.
+    // 3 rifle crates + 1 shotgun + 1 rocket per level (rocket suppressed if
+    // the level builder already places one — e.g. level 0's side chamber).
     const target = farSlots.length;
-    const rifleCount  = Math.min(3, target);
-    const rocketCount = Math.min(2, Math.max(0, target - rifleCount));
+    const rifleCount   = Math.min(3, target);
+    const hasBuiltInRocket = !!(level.rocketPickup);
+    const rocketCount  = (!hasBuiltInRocket && target - rifleCount > 0) ? 1 : 0;
+    const shotgunCount = (target - rifleCount - rocketCount > 0) ? 1 : 0;
     let cursor = 0;
     for (let k = 0; k < rifleCount; k++, cursor++) {
       const slot = farSlots[idx[cursor]];
@@ -347,27 +403,46 @@
         mesh, picked: false, _respawnAt: 0
       });
     }
+    for (let k = 0; k < shotgunCount; k++, cursor++) {
+      const slot = farSlots[idx[cursor]];
+      const mesh = makeShotgunPickupMesh();
+      mesh.position.set(slot.x, 0, slot.z);
+      scene.add(mesh);
+      soloShotgunPickups.push({
+        position: new THREE.Vector3(slot.x, 0.55, slot.z),
+        mesh, picked: false, _respawnAt: 0
+      });
+    }
   }
 
   function scatterMpRocketPickups() {
-    clearMpRocketPickups();
+    clearMpPickups();
     if (!multiplayerMode) return;
     const slots = level.enemySpawns;
     if (!slots || slots.length === 0) return;
-    // Shuffle a copy, take up to N
+    // Shuffle a copy, take 1 rocket + 1 shotgun
     const idx = slots.map((_, i) => i);
     for (let i = idx.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       const tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
     }
-    const count = Math.min(1, idx.length); // exactly one rocket spawn per map
-    for (let k = 0; k < count; k++) {
-      const sp = slots[idx[k]];
+    if (idx.length >= 1) {
+      const sp = slots[idx[0]];
       const mesh = makeRocketPickupMesh();
       mesh.position.set(sp.x, 0, sp.z);
       scene.add(mesh);
       mpRocketPickups.push({
         position: new THREE.Vector3(sp.x, 0.6, sp.z),
+        mesh, picked: false, _respawnAt: 0
+      });
+    }
+    if (idx.length >= 2) {
+      const sp = slots[idx[1]];
+      const mesh = makeShotgunPickupMesh();
+      mesh.position.set(sp.x, 0, sp.z);
+      scene.add(mesh);
+      mpShotgunPickups.push({
+        position: new THREE.Vector3(sp.x, 0.55, sp.z),
         mesh, picked: false, _respawnAt: 0
       });
     }
@@ -404,6 +479,20 @@
     }
     for (let i = 0; i < soloRocketPickups.length; i++) {
       const p = soloRocketPickups[i];
+      if (p.picked && p._respawnAt && now >= p._respawnAt) {
+        p.picked = false; p._respawnAt = 0;
+        if (p.mesh) p.mesh.visible = true;
+      }
+    }
+    for (let i = 0; i < soloShotgunPickups.length; i++) {
+      const p = soloShotgunPickups[i];
+      if (p.picked && p._respawnAt && now >= p._respawnAt) {
+        p.picked = false; p._respawnAt = 0;
+        if (p.mesh) p.mesh.visible = true;
+      }
+    }
+    for (let i = 0; i < mpShotgunPickups.length; i++) {
+      const p = mpShotgunPickups[i];
       if (p.picked && p._respawnAt && now >= p._respawnAt) {
         p.picked = false; p._respawnAt = 0;
         if (p.mesh) p.mesh.visible = true;
@@ -919,6 +1008,50 @@
         sound.play("pickupAmmo", { volume: 0.9 });
       } else if (p.mesh) {
         p.mesh.rotation.y += 0.025;
+      }
+    }
+
+    // Solo shotgun pickup
+    for (let i = 0; i < soloShotgunPickups.length; i++) {
+      const p = soloShotgunPickups[i];
+      if (p.picked) continue;
+      const dx = p.position.x - px, dy = p.position.y - py, dz = p.position.z - pz;
+      if (dx*dx + dy*dy + dz*dz < 1.8 * 1.8) {
+        if (weapon.shotgun && weapon.shotgun.ammo >= weapon.shotgun.maxAmmo) continue;
+        p.picked = true;
+        p._respawnAt = nowSec + PICKUP_RESPAWN_S.soloShotgun;
+        if (p.mesh) p.mesh.visible = false;
+        if (weapon.shotgun) {
+          weapon.shotgun.ammo = Math.min(weapon.shotgun.maxAmmo, weapon.shotgun.ammo + 12);
+        }
+        ui.setAmmo(weapon.ammo);
+        ui.pickupFlash();
+        ui.message("SHOTGUN +12 SHELLS — PRESS 3", 1700);
+        sound.play("pickupAmmo", { volume: 0.85 });
+      } else if (p.mesh) {
+        p.mesh.rotation.y += 0.022;
+      }
+    }
+
+    // MP shotgun pickup
+    for (let i = 0; i < mpShotgunPickups.length; i++) {
+      const p = mpShotgunPickups[i];
+      if (p.picked) continue;
+      const dx = p.position.x - px, dy = p.position.y - py, dz = p.position.z - pz;
+      if (dx*dx + dy*dy + dz*dz < 1.8 * 1.8) {
+        if (weapon.shotgun && weapon.shotgun.ammo >= weapon.shotgun.maxAmmo) continue;
+        p.picked = true;
+        p._respawnAt = nowSec + PICKUP_RESPAWN_S.mpShotgun;
+        if (p.mesh) p.mesh.visible = false;
+        if (weapon.shotgun) {
+          weapon.shotgun.ammo = Math.min(weapon.shotgun.maxAmmo, weapon.shotgun.ammo + 12);
+        }
+        ui.setAmmo(weapon.ammo);
+        ui.pickupFlash();
+        ui.message("SHOTGUN +12 SHELLS", 1500);
+        sound.play("pickupAmmo", { volume: 0.85 });
+      } else if (p.mesh) {
+        p.mesh.rotation.y += 0.022;
       }
     }
 
