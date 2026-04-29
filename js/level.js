@@ -545,13 +545,31 @@ window.Game.Level = class
     const pos = new THREE.Vector3();
     const euler = new THREE.Euler();
 
+    // Detect the "big axis" — the axis whose +/- faces are the strictly
+    // largest pair on this box. We extend ONLY the big-axis faces (in both
+    // in-plane directions) by the perpendicular box thickness so 270deg
+    // corner pockets between adjacent walls/floor edges are filled.
+    // Cubic shapes (pillars) tie — bigAxis stays null and no extension is
+    // applied (they're free-standing and don't have corner gaps).
+    const aXY = sy * sz; // +/-X face area
+    const aYZ = sx * sz; // +/-Y face area
+    const aZX = sx * sy; // +/-Z face area
+    const TIE_EPS = 1e-3;
+    let bigAxis = null;
+    if (aZX > aYZ + TIE_EPS && aZX > aXY + TIE_EPS) bigAxis = 'z';
+    else if (aYZ > aZX + TIE_EPS && aYZ > aXY + TIE_EPS) bigAxis = 'y';
+    else if (aXY > aZX + TIE_EPS && aXY > aYZ + TIE_EPS) bigAxis = 'x';
+    const extX = (bigAxis === 'x') ? sx : 0;
+    const extY = (bigAxis === 'y') ? sy : 0;
+    const extZ = (bigAxis === 'z') ? sz : 0;
+
     // +X face: normal = +X, plane local-x = world-z, plane local-y = world-y
     if (faceMask & 1)
     {
       euler.set(0, Math.PI * 0.5, 0);
       q.setFromEuler(euler);
       pos.set(cx + halfSx, cy, cz);
-      this._emitPlane(material, pos, q, sz, sy);
+      this._emitPlane(material, pos, q, sz + extX, sy + extX);
     }
     // -X face
     if (faceMask & 2)
@@ -559,7 +577,7 @@ window.Game.Level = class
       euler.set(0, -Math.PI * 0.5, 0);
       q.setFromEuler(euler);
       pos.set(cx - halfSx, cy, cz);
-      this._emitPlane(material, pos, q, sz, sy);
+      this._emitPlane(material, pos, q, sz + extX, sy + extX);
     }
     // +Y face (top)
     if (faceMask & 4)
@@ -567,7 +585,7 @@ window.Game.Level = class
       euler.set(-Math.PI * 0.5, 0, 0);
       q.setFromEuler(euler);
       pos.set(cx, cy + halfSy, cz);
-      this._emitPlane(material, pos, q, sx, sz);
+      this._emitPlane(material, pos, q, sx + extY, sz + extY);
     }
     // -Y face (bottom)
     if (faceMask & 8)
@@ -575,14 +593,14 @@ window.Game.Level = class
       euler.set(Math.PI * 0.5, 0, 0);
       q.setFromEuler(euler);
       pos.set(cx, cy - halfSy, cz);
-      this._emitPlane(material, pos, q, sx, sz);
+      this._emitPlane(material, pos, q, sx + extY, sz + extY);
     }
     // +Z face
     if (faceMask & 16)
     {
       q.set(0, 0, 0, 1);
       pos.set(cx, cy, cz + halfSz);
-      this._emitPlane(material, pos, q, sx, sy);
+      this._emitPlane(material, pos, q, sx + extZ, sy + extZ);
     }
     // -Z face
     if (faceMask & 32)
@@ -590,7 +608,7 @@ window.Game.Level = class
       euler.set(0, Math.PI, 0);
       q.setFromEuler(euler);
       pos.set(cx, cy, cz - halfSz);
-      this._emitPlane(material, pos, q, sx, sy);
+      this._emitPlane(material, pos, q, sx + extZ, sy + extZ);
     }
   }
 
@@ -765,14 +783,19 @@ window.Game.Level = class
       const uvAttr = new THREE.InstancedBufferAttribute(uvScales, 2);
       uvAttr.setUsage(THREE.StaticDrawUsage);
 
+      // The diffuse canvas already has a 4x4 stone-block grid baked in;
+      // setting UV-scale = world-size meant 16 stones per world meter,
+      // which read as fine noise / "stretched" tile mush. Divide by the
+      // canvas's intrinsic tile span (4m) so each stone is ~25cm wide.
+      const TEX_TILE_M = 4;
       for (let k = 0; k < count; k++)
       {
         const inst = queue[k];
         scale.set(inst.uSize, inst.vSize, 1);
         mat4.compose(inst.pos, inst.quat, scale);
         im.setMatrixAt(k, mat4);
-        uvScales[k * 2    ] = inst.uSize;
-        uvScales[k * 2 + 1] = inst.vSize;
+        uvScales[k * 2    ] = inst.uSize / TEX_TILE_M;
+        uvScales[k * 2 + 1] = inst.vSize / TEX_TILE_M;
       }
       im.instanceMatrix.needsUpdate = true;
       im.geometry.setAttribute('instanceUVScale', uvAttr);
