@@ -18,18 +18,21 @@
   ];
 
   // ---------- Renderer / scene / camera ----------
+  // Perf-tuned: pixelRatio=1 halves fragment shader cost on retina displays;
+  // far plane tightened from 400 to 120 (largest map is 60x60, generous);
+  // antialias on for quality — disable to "false" if still slow.
   const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setPixelRatio(1);
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.outputEncoding = THREE.sRGBEncoding;
   document.body.appendChild(renderer.domElement);
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0b0a08);
-  scene.fog = new THREE.Fog(0x0b0a08, 6, 60);
+  scene.fog = new THREE.Fog(0x0b0a08, 6, 55);
 
   const camera = new THREE.PerspectiveCamera(
-    78, window.innerWidth / window.innerHeight, 0.05, 400
+    78, window.innerWidth / window.innerHeight, 0.05, 120
   );
 
   // ---------- HUD ----------
