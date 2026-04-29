@@ -155,6 +155,8 @@
       // Map-select hooks
       this.onWelcome = typeof opts.onWelcome === 'function' ? opts.onWelcome : null;     // ({map, isFirst, peers}) - server's initial response
       this.onMapChange = typeof opts.onMapChange === 'function' ? opts.onMapChange : null; // (mapIdx) - someone (incl. us) chose a map
+      // Chat hook: invoked with ({from, name, text, at}) when the server relays a chat message.
+      this.onChat = typeof opts.onChat === 'function' ? opts.onChat : null;
 
       this.ws = null;
       this.connected = false;
@@ -434,6 +436,18 @@
           }
           break;
 
+        case 'chat':
+          if (typeof this.onChat === 'function') {
+            const text = typeof msg.text === 'string' ? msg.text : '';
+            const name = typeof msg.name === 'string' ? msg.name : 'PLAYER';
+            const from = typeof msg.from === 'string' ? msg.from : null;
+            const at = isFiniteNum(msg.at) ? msg.at : Date.now();
+            if (text) {
+              this.onChat({ from, name, text, at });
+            }
+          }
+          break;
+
         default:
           break;
       }
@@ -532,6 +546,19 @@
           targetId: targetId,
           dmg: isFiniteNum(dmg) ? dmg : 0
         }));
+      } catch (_) { /* ignore */ }
+    }
+
+    // Send a chat line to the server, which will broadcast it to all clients (including us).
+    // Validates: non-empty after trim, <=200 chars after trim, only sends when connected.
+    sendChat(text) {
+      if (!this.connected || !this.ws || this.ws.readyState !== 1) return;
+      if (typeof text !== 'string') return;
+      const cleaned = text.replace(/[\x00-\x1F\x7F]/g, '').trim();
+      if (!cleaned) return;
+      if (cleaned.length > 200) return;
+      try {
+        this.ws.send(JSON.stringify({ type: 'chat', text: cleaned }));
       } catch (_) { /* ignore */ }
     }
 

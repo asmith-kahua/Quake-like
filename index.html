@@ -294,6 +294,47 @@
   }
   #host-controls button:hover { background: #ffaa44; color: #1a0a05; }
 
+  #pause-menu {
+    position: fixed;
+    inset: 0;
+    background: rgba(8, 4, 2, 0.78);
+    z-index: 105;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    color: #d8b070;
+    text-align: center;
+  }
+  #pause-menu h1 {
+    font-size: 48px;
+    letter-spacing: 12px;
+    color: #ff8030;
+    margin: 0 0 36px;
+    text-shadow: 3px 3px 0 #000;
+  }
+  #pause-menu .pause-buttons {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  #pause-menu button {
+    background: rgba(40, 22, 12, 0.9);
+    color: #ffd590;
+    border: 1px solid #d8b070;
+    padding: 14px 60px;
+    font-family: "Courier New", monospace;
+    font-size: 16px;
+    letter-spacing: 6px;
+    cursor: pointer;
+    pointer-events: auto;
+    min-width: 320px;
+    transition: all 0.15s;
+  }
+  #pause-menu button:hover { background: #d8b070; color: #1a0a05; }
+  #pause-menu button.primary { color: #ffaa44; border-color: #ffaa44; }
+  #pause-menu button.primary:hover { background: #ffaa44; color: #1a0a05; }
+
   #damage-flash {
     position: fixed;
     inset: 0;
@@ -347,6 +388,14 @@
 
 <div id="host-controls">
   <button id="reset-match">RESET MATCH</button>
+</div>
+
+<div id="pause-menu">
+  <h1>PAUSED</h1>
+  <div class="pause-buttons">
+    <button class="primary" id="btn-resume">RESUME</button>
+    <button id="btn-quit">QUIT TO MAIN MENU</button>
+  </div>
 </div>
 
 <div id="overlay">

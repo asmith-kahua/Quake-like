@@ -737,10 +737,13 @@
   document.getElementById("btn-solo").addEventListener("click", () => beginGame(false));
   document.getElementById("btn-mp").addEventListener("click",   () => beginGame(true));
 
+  const pauseMenu = document.getElementById("pause-menu");
+
   document.addEventListener("pointerlockchange", () => {
     const locked = document.pointerLockElement === renderer.domElement;
     if (locked) {
       overlay.style.display = "none";
+      if (pauseMenu) pauseMenu.style.display = "none";
       paused = false;
       if (!started) {
         started = true;
@@ -750,19 +753,31 @@
     } else {
       paused = true;
       if (weapon) weapon.firing = false;
-      // Don't re-show overlay if game is finished (victory state).
-      if (!levelComplete || currentLevelIndex < TOTAL_LEVELS - 1) {
+      // If the game has started, show the pause menu (Resume / Quit).
+      // Otherwise (very first load) show the start overlay.
+      if (started && (!levelComplete || currentLevelIndex < TOTAL_LEVELS - 1)) {
+        if (pauseMenu) pauseMenu.style.display = "flex";
+      } else if (!started) {
         overlay.style.display = "flex";
-        if (player.dead) {
-          overlay.querySelector("h1").textContent = "YOU DIED";
-          overlay.querySelector("h2").textContent = "PRESS R AFTER RECONNECTING";
-        } else {
-          overlay.querySelector("h1").textContent = "PAUSED";
-          overlay.querySelector("h2").textContent = "";
-        }
       }
     }
   });
+
+  // Pause menu buttons
+  const btnResume = document.getElementById("btn-resume");
+  const btnQuit   = document.getElementById("btn-quit");
+  if (btnResume) {
+    btnResume.addEventListener("click", () => {
+      if (pauseMenu) pauseMenu.style.display = "none";
+      try { renderer.domElement.requestPointerLock(); } catch (_) { /* ignore */ }
+    });
+  }
+  if (btnQuit) {
+    btnQuit.addEventListener("click", () => {
+      // Reload — cleanest way to get back to a fresh main menu (disconnects MP, resets all state).
+      window.location.reload();
+    });
+  }
 
   window.addEventListener("resize", () => {
     camera.aspect = window.innerWidth / window.innerHeight;

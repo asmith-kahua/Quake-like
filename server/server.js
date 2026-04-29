@@ -14,6 +14,7 @@ const TICK_HZ = 20;
 const TICK_MS = Math.round(1000 / TICK_HZ);
 const HEARTBEAT_TIMEOUT_MS = 5000;
 const MAX_NAME_LEN = 24;
+const MAX_CHAT_LEN = 200;
 
 // Map<id, { id, ws, name, x, y, z, yaw, pitch, weapon, hp, lastSeen, joinedAt }>
 const clients = new Map();
@@ -336,6 +337,22 @@ function handleExplosion(client, msg) {
   });
 }
 
+function handleChat(client, msg) {
+  if (!msg) return;
+  if (typeof msg.text !== 'string') return;
+  // Strip control characters (excluding ordinary printable + non-ASCII unicode); trim whitespace.
+  const cleaned = msg.text.replace(/[\x00-\x1F\x7F]/g, '').trim();
+  if (!cleaned) return;                      // drop empty messages
+  if (cleaned.length > MAX_CHAT_LEN) return; // drop oversized messages
+  broadcastAll({
+    type: 'chat',
+    from: client.id,
+    name: client.name,
+    text: cleaned,
+    at: Date.now()
+  });
+}
+
 function handleHit(client, msg) {
   if (!msg) return;
   const targetId = typeof msg.targetId === 'string' ? msg.targetId : null;
@@ -363,6 +380,7 @@ function dispatch(client, msg) {
     case 'setMode': handleSetMode(client, msg); break;
     case 'resetMatch': handleResetMatch(client, msg); break;
     case 'death': handleDeath(client, msg); break;
+    case 'chat': handleChat(client, msg); break;
     default: break;
   }
 }
