@@ -100,12 +100,28 @@
   let player  = new Game.Player(scene, camera, level, ui, renderer.domElement);
 
   // Solo: spawn bots scaled by level. Difficulty: easy 0-1, medium 2-3, hard 4.
+  // Enemies within SPAWN_SAFE_RADIUS of the player's spawn are filtered out so
+  // the player isn't immediately attacked at level start.
+  const SPAWN_SAFE_RADIUS = 8;
   function spawnSoloOpponents(scene_, lvl) {
     if (!Game.spawnBots) return Game.spawnEnemies(scene_, lvl);
     const idx = (lvl && typeof lvl.levelIndex === "number") ? lvl.levelIndex : 0;
     const difficulty = idx <= 1 ? "easy" : (idx <= 3 ? "medium" : "hard");
-    const count = (lvl.enemySpawns && lvl.enemySpawns.length) || 4;
-    return Game.spawnBots(scene_, lvl, count, difficulty);
+    const sp = lvl.spawnPoint;
+    const r2 = SPAWN_SAFE_RADIUS * SPAWN_SAFE_RADIUS;
+    const safe = (lvl.enemySpawns || []).filter((p) => {
+      const dx = p.x - sp.x, dz = p.z - sp.z;
+      return dx * dx + dz * dz >= r2;
+    });
+    if (safe.length === 0) {
+      // Fallback: use the original list if filtering removed everything.
+      const count = (lvl.enemySpawns && lvl.enemySpawns.length) || 4;
+      return Game.spawnBots(scene_, lvl, count, difficulty);
+    }
+    // Pass a level proxy with the filtered spawns so spawnBots picks safely.
+    const wrapped = Object.create(lvl);
+    wrapped.enemySpawns = safe;
+    return Game.spawnBots(scene_, wrapped, safe.length, difficulty);
   }
   let enemies = spawnSoloOpponents(scene, level);
   let weapon  = new Game.Weapon(scene, camera, ui);
@@ -203,9 +219,13 @@
   // ---------- Pickup respawning ----------
   const PICKUP_RESPAWN_S = {
     health: 18,        // health crystals
-    rocketLauncher: 22 // rocket-launcher pickup (gives ammo)
+    rocketLauncher: 22, // MP scattered rocket pickup + level 0 built-in
+    soloRifle: 15,     // periodic rifle-ammo crates in solo
+    soloRocket: 40     // periodic rocket-ammo pickups in solo (longer cycle)
   };
-  const mpRocketPickups = []; // extra rocket pickups scattered in PvP, { position, mesh, picked, _respawnAt }
+  const mpRocketPickups = [];   // PvP-only scattered rockets
+  const soloRiflePickups = [];  // solo: rifle-ammo crates
+  const soloRocketPickups = []; // solo: rocket-ammo pickups
 
   function makeRocketPickupMesh() {
     const g = new THREE.Group();
@@ -238,12 +258,95 @@
     return g;
   }
 
+  // Khaki ammo crate (rifle ammo).
+  function makeRifleAmmoMesh() {
+    const g = new THREE.Group();
+    g.userData.isPickup = true;
+    const box = new THREE.Mesh(
+      new THREE.BoxGeometry(0.45, 0.28, 0.32),
+      new THREE.MeshStandardMaterial({
+        color: 0x6a7038, emissive: 0x222a10, emissiveIntensity: 0.35, roughness: 0.7
+      })
+    );
+    box.position.y = 0.18;
+    g.add(box);
+    const strap = new THREE.Mesh(
+      new THREE.BoxGeometry(0.50, 0.08, 0.06),
+      new THREE.MeshStandardMaterial({
+        color: 0xb08840, emissive: 0x442200, emissiveIntensity: 0.3, roughness: 0.4
+      })
+    );
+    strap.position.set(0, 0.18, 0.19);
+    g.add(strap);
+    const glow = new THREE.PointLight(0xaaff66, 0.35, 2.5, 2);
+    glow.position.y = 0.4;
+    g.add(glow);
+    return g;
+  }
+
   function clearMpRocketPickups() {
     for (let i = 0; i < mpRocketPickups.length; i++) {
       const p = mpRocketPickups[i];
       if (p.mesh && p.mesh.parent) p.mesh.parent.remove(p.mesh);
     }
     mpRocketPickups.length = 0;
+  }
+
+  function clearSoloPickups() {
+    for (const arr of [soloRiflePickups, soloRocketPickups]) {
+      for (let i = 0; i < arr.length; i++) {
+        const p = arr[i];
+        if (p.mesh && p.mesh.parent) p.mesh.parent.remove(p.mesh);
+      }
+      arr.length = 0;
+    }
+  }
+
+  // Scatter periodic rifle + rocket ammo pickups across solo levels.
+  // Uses enemySpawns as candidate slots, filtered to be at least
+  // SPAWN_SAFE_RADIUS from the player spawn so the player isn't immediately
+  // overwhelmed AND the pickups don't sit on top of the player.
+  function scatterSoloPickups() {
+    clearSoloPickups();
+    if (multiplayerMode) return;
+    const slots = level.enemySpawns;
+    if (!slots || slots.length === 0) return;
+    const sp = level.spawnPoint;
+    const r2 = (SPAWN_SAFE_RADIUS - 1) * (SPAWN_SAFE_RADIUS - 1); // 7m: pickups can be slightly closer than enemies
+    const farSlots = slots.filter((p) => {
+      const dx = p.x - sp.x, dz = p.z - sp.z;
+      return dx * dx + dz * dz >= r2;
+    });
+    const idx = farSlots.map((_, i) => i);
+    for (let i = idx.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
+    }
+    // ~3 rifle ammo crates, ~1-2 rocket pickups, scaled to slot availability.
+    const target = farSlots.length;
+    const rifleCount  = Math.min(3, target);
+    const rocketCount = Math.min(2, Math.max(0, target - rifleCount));
+    let cursor = 0;
+    for (let k = 0; k < rifleCount; k++, cursor++) {
+      const slot = farSlots[idx[cursor]];
+      const mesh = makeRifleAmmoMesh();
+      mesh.position.set(slot.x, 0, slot.z);
+      scene.add(mesh);
+      soloRiflePickups.push({
+        position: new THREE.Vector3(slot.x, 0.3, slot.z),
+        mesh, picked: false, _respawnAt: 0
+      });
+    }
+    for (let k = 0; k < rocketCount; k++, cursor++) {
+      const slot = farSlots[idx[cursor]];
+      const mesh = makeRocketPickupMesh();
+      mesh.position.set(slot.x, 0, slot.z);
+      scene.add(mesh);
+      soloRocketPickups.push({
+        position: new THREE.Vector3(slot.x, 0.6, slot.z),
+        mesh, picked: false, _respawnAt: 0
+      });
+    }
   }
 
   function scatterMpRocketPickups() {
@@ -292,7 +395,25 @@
         if (p.mesh) p.mesh.visible = true;
       }
     }
+    for (let i = 0; i < soloRiflePickups.length; i++) {
+      const p = soloRiflePickups[i];
+      if (p.picked && p._respawnAt && now >= p._respawnAt) {
+        p.picked = false; p._respawnAt = 0;
+        if (p.mesh) p.mesh.visible = true;
+      }
+    }
+    for (let i = 0; i < soloRocketPickups.length; i++) {
+      const p = soloRocketPickups[i];
+      if (p.picked && p._respawnAt && now >= p._respawnAt) {
+        p.picked = false; p._respawnAt = 0;
+        if (p.mesh) p.mesh.visible = true;
+      }
+    }
   }
+
+  // Scatter ammo on the INITIAL level (loadLevel only fires on transitions).
+  // multiplayerMode is still false at this point so this only seeds solo play.
+  scatterSoloPickups();
 
   // Pool of 2-vertex line geometries reused across remote tracers (same
   // pattern as weapons.js _tracerPool — avoids a new BufferGeometry alloc
@@ -635,6 +756,7 @@
 
     minimap.setLevel(level);
     scatterMpRocketPickups();
+    scatterSoloPickups();
     sound.play("levelStart", { volume: 0.7 });
     levelComplete = false;
     levelTransitionT = 0;
@@ -755,6 +877,46 @@
         ui.pickupFlash();
         ui.message("ROCKETS +5", 1500);
         sound.play("pickupAmmo", { volume: 0.85 });
+      } else if (p.mesh) {
+        p.mesh.rotation.y += 0.025;
+      }
+    }
+
+    // Solo rifle ammo crates
+    for (let i = 0; i < soloRiflePickups.length; i++) {
+      const p = soloRiflePickups[i];
+      if (p.picked) continue;
+      const dx = p.position.x - px, dy = p.position.y - py, dz = p.position.z - pz;
+      if (dx*dx + dy*dy + dz*dz < 1.6 * 1.6) {
+        if (weapon.rifle.ammo >= weapon.rifle.maxAmmo) continue;
+        p.picked = true;
+        p._respawnAt = nowSec + PICKUP_RESPAWN_S.soloRifle;
+        if (p.mesh) p.mesh.visible = false;
+        weapon.rifle.ammo = Math.min(weapon.rifle.maxAmmo, weapon.rifle.ammo + 25);
+        ui.setAmmo(weapon.ammo);
+        ui.pickupFlash();
+        ui.message("RIFLE AMMO +25", 1300);
+        sound.play("pickupAmmo", { volume: 0.85 });
+      } else if (p.mesh) {
+        p.mesh.rotation.y += 0.018;
+      }
+    }
+
+    // Solo rocket ammo pickups (longer respawn)
+    for (let i = 0; i < soloRocketPickups.length; i++) {
+      const p = soloRocketPickups[i];
+      if (p.picked) continue;
+      const dx = p.position.x - px, dy = p.position.y - py, dz = p.position.z - pz;
+      if (dx*dx + dy*dy + dz*dz < 1.8 * 1.8) {
+        if (weapon.rocket.ammo >= weapon.rocket.maxAmmo) continue;
+        p.picked = true;
+        p._respawnAt = nowSec + PICKUP_RESPAWN_S.soloRocket;
+        if (p.mesh) p.mesh.visible = false;
+        weapon.rocket.ammo = Math.min(weapon.rocket.maxAmmo, weapon.rocket.ammo + 4);
+        ui.setAmmo(weapon.ammo);
+        ui.pickupFlash();
+        ui.message("ROCKETS +4", 1300);
+        sound.play("pickupAmmo", { volume: 0.9 });
       } else if (p.mesh) {
         p.mesh.rotation.y += 0.025;
       }
