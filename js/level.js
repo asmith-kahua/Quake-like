@@ -222,10 +222,14 @@ window.Game.Level = class
     // surface type. All canvases are kept around (anchored on textures via
     // CanvasTexture.image). Computing normal/spec maps from the diffuse is
     // a one-time cost per level.
-    const wallSet  = this._buildTextureSet(128, p.wall[0],  p.wall[1],  0.55);
-    const floorSet = this._buildTextureSet(128, p.floor[0], p.floor[1], 0.45);
-    const trimSet  = this._buildTextureSet(128, p.trim[0],  p.trim[1],  0.65);
-    const ceilSet  = this._buildTextureSet(128, p.ceil[0],  p.ceil[1],  0.55);
+    // 256px canvases (was 128) so floors/long walls survive aggressive
+    // mipmap minification at oblique view angles. Anisotropy 16 (was 4)
+    // sharpens the streaking that shows when the camera looks down a long
+    // floor — modern GPUs all support 16x at no real cost.
+    const wallSet  = this._buildTextureSet(256, p.wall[0],  p.wall[1],  0.55);
+    const floorSet = this._buildTextureSet(256, p.floor[0], p.floor[1], 0.45);
+    const trimSet  = this._buildTextureSet(256, p.trim[0],  p.trim[1],  0.65);
+    const ceilSet  = this._buildTextureSet(256, p.ceil[0],  p.ceil[1],  0.55);
 
     const all = [
       wallSet.map, wallSet.normalMap, wallSet.specularMap,
@@ -240,7 +244,7 @@ window.Game.Level = class
       // We rely on a per-instance UV scaling shader hook (see _patchPhongShader),
       // so the texture's own .repeat stays at (1,1).
       t.repeat.set(1, 1);
-      t.anisotropy = 4;
+      t.anisotropy = 16;
       this._ownedTextures.push(t);
     });
 

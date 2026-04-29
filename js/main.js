@@ -256,14 +256,15 @@
     );
     ped.position.y = 0.05;
     g.add(ped);
-    const glow = new THREE.PointLight(0xff7733, 0.7, 4, 2);
-    glow.position.y = 0.6;
-    g.add(glow);
+    // No per-pickup PointLight — each scene-light contributes per-fragment
+    // shader cost; with 5+ pickups + 6 torches + explosion lights, we'd
+    // blow past r128's MeshPhong sweet spot. Emissive materials carry the
+    // visual weight instead.
     return g;
   }
 
   // Distinctive shotgun pickup — twin parallel barrels on a wood receiver
-  // floating over a brass-rimmed pedestal with a soft cyan glow.
+  // floating over a brass-rimmed pedestal.
   function makeShotgunPickupMesh() {
     const g = new THREE.Group();
     g.userData.isPickup = true;
@@ -301,9 +302,7 @@
     );
     ped.position.y = 0.05;
     g.add(ped);
-    const glow = new THREE.PointLight(0x66ddee, 0.6, 4, 2);
-    glow.position.y = 0.55;
-    g.add(glow);
+    // No per-pickup PointLight (see makeRocketPickupMesh comment).
     return g;
   }
 
@@ -327,9 +326,7 @@
     );
     strap.position.set(0, 0.18, 0.19);
     g.add(strap);
-    const glow = new THREE.PointLight(0xaaff66, 0.35, 2.5, 2);
-    glow.position.y = 0.4;
-    g.add(glow);
+    // No per-pickup PointLight (see makeRocketPickupMesh comment).
     return g;
   }
 
