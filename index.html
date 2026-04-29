@@ -245,6 +245,55 @@
   }
   #map-select button.confirm:hover { background: #ffaa44; color: #1a0a05; }
 
+  #map-select .modes {
+    display: flex;
+    gap: 14px;
+    justify-content: center;
+    margin: 0 0 24px;
+  }
+  #map-select .modes label {
+    background: rgba(40, 22, 12, 0.7);
+    border: 1px solid #6a4828;
+    padding: 10px 22px;
+    cursor: pointer;
+    pointer-events: auto;
+    font-size: 13px;
+    letter-spacing: 4px;
+    color: #d8b070;
+    transition: all 0.15s;
+  }
+  #map-select .modes label:hover { border-color: #d8b070; }
+  #map-select .modes input { display: none; }
+  #map-select .modes input:checked + span {
+    color: #ffaa44;
+  }
+  #map-select .modes label:has(input:checked) {
+    border-color: #ffaa44;
+    background: rgba(80, 44, 22, 0.95);
+    box-shadow: 0 0 8px rgba(255, 170, 68, 0.3);
+  }
+
+  #host-controls {
+    position: fixed;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 12;
+    display: none;
+    pointer-events: auto;
+  }
+  #host-controls button {
+    background: rgba(40, 22, 12, 0.85);
+    color: #ffaa44;
+    border: 1px solid #ffaa44;
+    padding: 6px 14px;
+    font-family: "Courier New", monospace;
+    font-size: 12px;
+    letter-spacing: 3px;
+    cursor: pointer;
+  }
+  #host-controls button:hover { background: #ffaa44; color: #1a0a05; }
+
   #damage-flash {
     position: fixed;
     inset: 0;
@@ -287,9 +336,17 @@
 
 <div id="map-select">
   <h1>SELECT MAP</h1>
-  <h3>YOU ARE THE HOST — PICK THE ARENA</h3>
+  <h3>YOU ARE THE HOST — PICK THE ARENA AND MODE</h3>
+  <div class="modes">
+    <label><input type="radio" name="gm" value="ffa" checked><span>FREE-FOR-ALL</span></label>
+    <label><input type="radio" name="gm" value="tdm"><span>TEAM DEATHMATCH</span></label>
+  </div>
   <div class="grid" id="map-grid"></div>
   <button class="confirm" id="map-confirm">START MATCH</button>
+</div>
+
+<div id="host-controls">
+  <button id="reset-match">RESET MATCH</button>
 </div>
 
 <div id="overlay">
@@ -319,6 +376,8 @@
 <script src="js/sound.js"></script>
 <script src="js/minimap.js"></script>
 <script src="js/network.js"></script>
+<script src="js/bots.js"></script>
+<script src="js/hud-extras.js"></script>
 <script src="js/main.js"></script>
 
 </body>

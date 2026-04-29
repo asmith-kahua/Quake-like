@@ -109,6 +109,67 @@
   const minimap = new Game.Minimap(level);
   minimap.attachTo(document.body);
 
+  // ---------- Kill feed + scoreboard ----------
+  const killFeed   = (Game.KillFeed   ? new Game.KillFeed()   : null);
+  const scoreboard = (Game.Scoreboard ? new Game.Scoreboard() : null);
+  if (killFeed)   killFeed.attachTo(document.body);
+  if (scoreboard) scoreboard.attachTo(document.body);
+
+  // Death attribution: track who damaged us most recently (peerId).
+  let lastDamagedBy = null;
+  let lastDamagedAt = 0;
+  const DAMAGE_ATTRIBUTION_WINDOW = 6; // seconds
+
+  function refreshScoreboard() {
+    if (!scoreboard || !network) return;
+    const players = [];
+    // Local player
+    players.push({
+      id: network.id || "me",
+      name: (network.name || "PLAYER") + " (YOU)",
+      frags: (network.scores && network.scores.get(network.id)) || 0,
+      deaths: 0,
+      team: network.myTeam || null,
+      isMe: true,
+      isHost: !!network.amHost && network.amHost()
+    });
+    // Remote peers
+    network.remotes.forEach((r, peerId) => {
+      players.push({
+        id: peerId,
+        name: r.currentName || "PLAYER",
+        frags: (network.scores && network.scores.get(peerId)) || 0,
+        deaths: 0,
+        team: r.team || null,
+        isMe: false,
+        isHost: peerId === network.hostId
+      });
+    });
+    scoreboard.update({ mode: network.gameMode || "ffa", players });
+  }
+
+  function recolorRemotesByTeam() {
+    if (!network) return;
+    const TEAM_RED  = new THREE.Color(0xc8482a);
+    const TEAM_BLUE = new THREE.Color(0x2a6ec8);
+    network.remotes.forEach((r) => {
+      const tint = r.team === "red" ? TEAM_RED : (r.team === "blue" ? TEAM_BLUE : null);
+      r.group.traverse((m) => {
+        if (m.isMesh && m.material && m.material.color && tint) {
+          // Blend toward team color for clarity (don't fully overwrite hue)
+          m.material.color.copy(tint);
+        }
+      });
+    });
+  }
+
+  function refreshHostControls() {
+    const hc = document.getElementById("host-controls");
+    if (!hc) return;
+    const showHost = !!(multiplayerMode && network && network.amHost && network.amHost() && started);
+    hc.style.display = showHost ? "block" : "none";
+  }
+
   // ---------- Multiplayer (lazy: only initialized if user joins) ----------
   let network = null;
   let multiplayerMode = false; // PvP-only: no mobs, no level-clear gating
@@ -297,13 +358,43 @@
       },
       onMapChange: (mapIdx) => {
         loadMpMap(mapIdx);
+      },
+      onModeChange: (mode, teamsObj) => {
+        // Apply incoming team data to remote records (server is authoritative).
+        if (network && teamsObj) {
+          network.remotes.forEach((r, id) => {
+            r.team = teamsObj[id] || null;
+          });
+        }
+        recolorRemotesByTeam();
+        refreshScoreboard();
+        ui.message((mode === "tdm" ? "TEAM DEATHMATCH" : "FREE-FOR-ALL"), 1800);
+      },
+      onScoreUpdate: (scoresObj) => {
+        refreshScoreboard();
+      },
+      onScoreReset: () => {
+        if (killFeed && killFeed.clear) killFeed.clear();
+        refreshScoreboard();
+        ui.message("MATCH RESET", 1800);
+      },
+      onHostChange: (hostId) => {
+        refreshHostControls();
+        refreshScoreboard();
       }
     });
     // Inbound damage from another player.
     network.onHit = (info) => {
       if (!info || !info.dmg || player.dead) return;
       const dmg = Math.max(0, Math.min(200, +info.dmg || 0));
-      if (dmg > 0) player.takeDamage(dmg);
+      if (dmg > 0) {
+        // Track attacker for death-attribution.
+        if (info.from) {
+          lastDamagedBy = info.from;
+          lastDamagedAt = clock.elapsedTime;
+        }
+        player.takeDamage(dmg);
+      }
     };
     network.connect();
     multiplayerMode = true;
@@ -330,6 +421,9 @@
     }
     const opt = MAP_OPTIONS[idx];
     ui.message("PVP DEATHMATCH — " + (opt ? opt.name : "MAP " + idx), 2600);
+    refreshHostControls();
+    refreshScoreboard();
+    recolorRemotesByTeam();
     // Acquire pointer if we're not yet locked.
     if (document.pointerLockElement !== renderer.domElement) {
       try { renderer.domElement.requestPointerLock(); } catch (_) { /* ignore */ }
@@ -371,9 +465,11 @@
   }
 
   mapConfirmEl.addEventListener("click", () => {
+    const modeRadio = document.querySelector('input[name="gm"]:checked');
+    const chosenMode = modeRadio ? modeRadio.value : "ffa";
     if (network && network.isConnected()) {
-      network.sendMapChoice(pendingMapChoice);
-      // Server will reply with mapChange, which triggers loadMpMap.
+      network.sendMapChoice(pendingMapChoice, chosenMode);
+      // Server will reply with mapChange + modeChange, which triggers loadMpMap.
     } else {
       // Network failed - fall back to local single-player on the chosen map.
       hideMapSelect();
@@ -382,6 +478,16 @@
       try { renderer.domElement.requestPointerLock(); } catch (_) { /* ignore */ }
     }
   });
+
+  // Reset-match button (host only, visibility controlled by refreshHostControls)
+  const resetBtn = document.getElementById("reset-match");
+  if (resetBtn) {
+    resetBtn.addEventListener("click", () => {
+      if (network && network.amHost && network.amHost() && network.sendResetMatch) {
+        network.sendResetMatch();
+      }
+    });
+  }
 
   // ---------- Level transitions ----------
   let levelTransitionT = 0;
@@ -658,6 +764,7 @@
   // ---------- Stat trackers ----------
   let killsCount = 0;
   let prevHealth = player.health;
+  let prevDead = player.dead;
   let prevAlive = enemies.map(e => e.alive);
   let prevOnGround = player.onGround;
   let prevWeapon = weapon.current;
@@ -681,12 +788,42 @@
       killsCount = killedNow;
       ui.setKills(killsCount, enemies.length);
     }
+    // In multiplayer, override the kill counter with frag totals.
+    if (multiplayerMode && network && network.isConnected()) {
+      const myFrags = (network.scores && network.scores.get(network.id)) || 0;
+      let totalFrags = 0;
+      if (network.scores) network.scores.forEach((v) => { totalFrags += v; });
+      ui.setKills(myFrags, totalFrags);
+    }
 
     // Health drop -> hurt sound
     if (player.health < prevHealth - 0.5) {
       sound.play("playerHurt", { volume: 0.8 });
     }
     prevHealth = player.health;
+
+    // Death transition: report kill attribution to the server.
+    if (!prevDead && player.dead) {
+      if (network && network.isConnected() && typeof network.sendDeath === "function") {
+        const stillFresh = (clock.elapsedTime - lastDamagedAt) <= DAMAGE_ATTRIBUTION_WINDOW;
+        const killer = (lastDamagedBy && stillFresh) ? lastDamagedBy : (network.id || null);
+        network.sendDeath(killer);
+        // Local kill-feed entry
+        if (killFeed) {
+          const killerName = killer === network.id ? "(self)" :
+            (network.peerNames && network.peerNames.get(killer)) ||
+            (network.remotes.get(killer) && network.remotes.get(killer).currentName) ||
+            "PLAYER";
+          killFeed.push(killerName, network.name || "YOU", weapon.current || "rifle");
+        }
+      }
+      lastDamagedBy = null;
+    }
+    prevDead = player.dead;
+    if (player.dead && document.pointerLockElement) {
+      // release the pointer so the player can click reset / overlay easily
+      try { document.exitPointerLock(); } catch (_) {}
+    }
 
     // Jump sound on takeoff
     if (prevOnGround && !player.onGround && player.velocity.y > 4) {

@@ -1,17 +1,19 @@
 // Game.Weapon - unified first-person weapon module.
 //
-// Hosts two weapons:
-//   1. Rifle  - fast hitscan chaingun-feel rifle (existing behaviour preserved).
-//   2. Rocket - bazooka with travel-time projectile, splash, knockback (new).
+// Hosts four weapons:
+//   1. Rifle    - fast hitscan chaingun-feel rifle (existing behaviour preserved).
+//   2. Rocket   - bazooka with travel-time projectile, splash, knockback.
+//   3. Shotgun  - hitscan multi-pellet cone (8 pellets per shell).
+//   4. Grenade  - arcing lobbed projectile that bounces and detonates with splash.
 //
 // Public contract (kept compatible with main.js & enemies.js):
 //   constructor(scene, camera, ui)
 //   update(dt, ctx)              ctx = { player, level, enemies, weapon, ui }
 //   fire(ctx)
 //   ammo                          (getter)  -> ammo of currently-selected weapon
-//   ammoRifle, ammoRocket         per-weapon counts
+//   ammoRifle, ammoRocket, ammoShotgun, ammoGrenade   per-weapon counts
 //   maxAmmo, fireRate, firing
-//   switchTo('rifle' | 'rocket')
+//   switchTo('rifle' | 'rocket' | 'shotgun' | 'grenade')
 //   current                       string, current weapon name
 //   cameraShake                   { intensity, duration }, decays in update()
 window.Game = window.Game || {};
@@ -57,6 +59,41 @@ window.Game.Weapon = class
       flashT: 0,
     };
 
+    // Shotgun stats (new) - hitscan, 8 pellets per shell
+    this.shotgun = {
+      ammo: 24,               // shells
+      maxAmmo: 60,
+      fireRate: 0.85,
+      damage: 12,             // per pellet
+      pellets: 8,
+      spread: 0.06,           // cone half-angle in radians
+      maxRange: 80,
+      fireTimer: 0,
+      kick: 0,
+      kickDecay: 5,
+      flashT: 0,
+    };
+
+    // Grenade launcher stats (new) - arcing projectile, bounces, splash
+    this.grenade = {
+      ammo: 6,
+      maxAmmo: 20,
+      fireRate: 0.85,
+      damage: 60,             // direct contact damage (mob/peer)
+      splashRadius: 5,
+      splashDamage: 80,       // peak splash damage at centre
+      selfDamageScale: 0.5,
+      projectileSpeed: 22,    // initial muzzle velocity
+      gravity: 18,             // m/s^2
+      maxBounces: 2,
+      bounceLoss: 0.45,       // velocity scale on bounce
+      maxLifetime: 4.0,       // seconds before forced detonation
+      fireTimer: 0,
+      kick: 0,
+      kickDecay: 6,
+      flashT: 0,
+    };
+
     // Active weapon name & generic state
     this.current = 'rifle';
     this.firing = false;
@@ -76,6 +113,9 @@ window.Game.Weapon = class
     // In-flight rockets
     this.rockets = [];
     this._smokeTimer = 0;
+
+    // In-flight grenades
+    this.grenades = [];
 
     // ---- Pre-allocate scratch math objects -------------------------------
     this.raycaster = new THREE.Raycaster();
@@ -110,19 +150,39 @@ window.Game.Weapon = class
     this._buildRocketViewmodel();
     this._buildRocketMuzzleFlash();
 
+    // Shotgun viewmodel
+    this.shotgunView = new THREE.Group();
+    this.shotgunView.name = 'ShotgunViewmodel';
+    this._shotgunRest = new THREE.Vector3(0.24, -0.23, -0.55);
+    this.shotgunView.position.copy(this._shotgunRest);
+    this._buildShotgunViewmodel();
+    this._buildShotgunMuzzleFlash();
+
+    // Grenade launcher viewmodel
+    this.grenadeView = new THREE.Group();
+    this.grenadeView.name = 'GrenadeViewmodel';
+    this._grenadeRest = new THREE.Vector3(0.23, -0.24, -0.55);
+    this.grenadeView.position.copy(this._grenadeRest);
+    this._buildGrenadeViewmodel();
+    this._buildGrenadeMuzzleFlash();
+
     // BACK-COMPAT: legacy code may inspect `viewmodel`; expose the active one.
     this.viewmodel = this.rifleView;
 
     camera.add(this.rifleView);
     camera.add(this.rocketView);
+    camera.add(this.shotgunView);
+    camera.add(this.grenadeView);
     if (!camera.parent)
     {
       scene.add(camera);
     }
 
     // Show rifle by default
-    this.rocketView.visible = false;
-    this.rifleView.visible  = true;
+    this.rocketView.visible  = false;
+    this.shotgunView.visible = false;
+    this.grenadeView.visible = false;
+    this.rifleView.visible   = true;
 
     // ---- Input ------------------------------------------------------------
     this._onMouseDown = (e) =>
@@ -141,6 +201,8 @@ window.Game.Weapon = class
       if (!document.pointerLockElement) return;
       if (e.code === 'Digit1')      this.switchTo('rifle');
       else if (e.code === 'Digit2') this.switchTo('rocket');
+      else if (e.code === 'Digit3') this.switchTo('shotgun');
+      else if (e.code === 'Digit4') this.switchTo('grenade');
     };
     document.addEventListener('mousedown', this._onMouseDown);
     document.addEventListener('mouseup', this._onMouseUp);
@@ -151,26 +213,34 @@ window.Game.Weapon = class
   // Compatibility getters / setters
   // -------------------------------------------------------------------------
 
+  // Returns the active weapon's stats block.
+  _activeWeapon()
+  {
+    if (this.current === 'rocket')  return this.rocket;
+    if (this.current === 'shotgun') return this.shotgun;
+    if (this.current === 'grenade') return this.grenade;
+    return this.rifle;
+  }
+
   // `ammo` reflects the active weapon (so existing UI code keeps working).
   get ammo()
   {
-    return this.current === 'rocket' ? this.rocket.ammo : this.rifle.ammo;
+    return this._activeWeapon().ammo;
   }
   // main.js does `weapon.ammo = 50` on respawn -> we route to active weapon.
   set ammo(v)
   {
-    if (this.current === 'rocket') this.rocket.ammo = v;
-    else                            this.rifle.ammo = v;
+    this._activeWeapon().ammo = v;
   }
 
   get maxAmmo()
   {
-    return this.current === 'rocket' ? this.rocket.maxAmmo : this.rifle.maxAmmo;
+    return this._activeWeapon().maxAmmo;
   }
 
   get fireRate()
   {
-    return this.current === 'rocket' ? this.rocket.fireRate : this.rifle.fireRate;
+    return this._activeWeapon().fireRate;
   }
 
   // Convenience per-weapon ammo accessors
@@ -178,6 +248,10 @@ window.Game.Weapon = class
   set ammoRifle(v) { this.rifle.ammo = v; }
   get ammoRocket()  { return this.rocket.ammo;  }
   set ammoRocket(v) { this.rocket.ammo = v; }
+  get ammoShotgun()  { return this.shotgun.ammo;  }
+  set ammoShotgun(v) { this.shotgun.ammo = v; }
+  get ammoGrenade()  { return this.grenade.ammo;  }
+  set ammoGrenade(v) { this.grenade.ammo = v; }
 
   // -------------------------------------------------------------------------
   // Texture builders (one-time)
@@ -532,12 +606,209 @@ window.Game.Weapon = class
   }
 
   // -------------------------------------------------------------------------
+  // Viewmodel construction - shotgun (new): chunky double-barrel
+  // -------------------------------------------------------------------------
+
+  _buildShotgunViewmodel()
+  {
+    const metalMat   = new THREE.MeshBasicMaterial({ color: 0x33333a });
+    const darkMetal  = new THREE.MeshBasicMaterial({ color: 0x18181c });
+    const woodMat    = new THREE.MeshBasicMaterial({ color: 0x6b3f20 });
+    const wood2Mat   = new THREE.MeshBasicMaterial({ color: 0x4d2d16 });
+    const accentMat  = new THREE.MeshBasicMaterial({ color: 0xa67838 });
+    const sightMat   = new THREE.MeshBasicMaterial({ color: 0x111114 });
+
+    // Wider receiver (chunkier than the rifle)
+    const receiverGeom = new THREE.BoxGeometry(0.22, 0.18, 0.32);
+    const receiver = new THREE.Mesh(receiverGeom, wood2Mat);
+    receiver.position.set(0, 0, 0);
+    this.shotgunView.add(receiver);
+
+    // Two parallel barrels (side-by-side double barrel)
+    const barrelGeom = new THREE.BoxGeometry(0.07, 0.07, 0.7);
+    const barrelL = new THREE.Mesh(barrelGeom, metalMat);
+    barrelL.position.set(-0.05, 0.025, -0.46);
+    this.shotgunView.add(barrelL);
+    const barrelR = new THREE.Mesh(barrelGeom, metalMat);
+    barrelR.position.set( 0.05, 0.025, -0.46);
+    this.shotgunView.add(barrelR);
+
+    // Top rib joining the two barrels
+    const ribGeom = new THREE.BoxGeometry(0.14, 0.02, 0.7);
+    const rib = new THREE.Mesh(ribGeom, darkMetal);
+    rib.position.set(0, 0.07, -0.46);
+    this.shotgunView.add(rib);
+
+    // Twin muzzle plates
+    const muzzleGeomL = new THREE.BoxGeometry(0.085, 0.085, 0.05);
+    const muzzleL = new THREE.Mesh(muzzleGeomL, darkMetal);
+    muzzleL.position.set(-0.05, 0.025, -0.84);
+    this.shotgunView.add(muzzleL);
+    const muzzleR = new THREE.Mesh(muzzleGeomL, darkMetal);
+    muzzleR.position.set( 0.05, 0.025, -0.84);
+    this.shotgunView.add(muzzleR);
+    // Use the centre between the two as the tracer origin
+    this._shotgunMuzzle = new THREE.Object3D();
+    this._shotgunMuzzle.position.set(0, 0.025, -0.86);
+    this.shotgunView.add(this._shotgunMuzzle);
+
+    // Front bead sight
+    const sightGeom = new THREE.BoxGeometry(0.018, 0.04, 0.04);
+    const sight = new THREE.Mesh(sightGeom, sightMat);
+    sight.position.set(0, 0.10, -0.78);
+    this.shotgunView.add(sight);
+
+    // Hardwood stock at the rear (chunky)
+    const stockGeom = new THREE.BoxGeometry(0.08, 0.16, 0.26);
+    const stock = new THREE.Mesh(stockGeom, woodMat);
+    stock.position.set(0, -0.04, 0.22);
+    this.shotgunView.add(stock);
+
+    // Brass-coloured trigger guard accent
+    const accentGeom = new THREE.BoxGeometry(0.18, 0.03, 0.07);
+    const accent = new THREE.Mesh(accentGeom, accentMat);
+    accent.position.set(0, -0.10, 0.05);
+    this.shotgunView.add(accent);
+
+    // Pistol grip
+    const gripGeom = new THREE.BoxGeometry(0.07, 0.20, 0.08);
+    const grip = new THREE.Mesh(gripGeom, woodMat);
+    grip.position.set(0, -0.18, 0.10);
+    grip.rotation.x = THREE.MathUtils.degToRad(20);
+    this.shotgunView.add(grip);
+
+    this.shotgunView.traverse((m) =>
+    {
+      if (m.isMesh && m.material)
+      {
+        m.material.depthTest = false;
+        m.material.depthWrite = false;
+        m.material.transparent = false;
+        m.renderOrder = 999;
+      }
+    });
+  }
+
+  _buildShotgunMuzzleFlash()
+  {
+    const mat = new THREE.MeshBasicMaterial({
+      map: this._flashTexture,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthTest: false,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    // Bigger than rifle flash
+    const geom = new THREE.PlaneGeometry(0.65, 0.65);
+    this._shotgunFlash = new THREE.Mesh(geom, mat);
+    this._shotgunFlash.position.set(0, 0.025, -0.88);
+    this._shotgunFlash.visible = false;
+    this._shotgunFlash.renderOrder = 1000;
+    this.shotgunView.add(this._shotgunFlash);
+  }
+
+  // -------------------------------------------------------------------------
+  // Viewmodel construction - grenade launcher (new): fat tube + drum mag
+  // -------------------------------------------------------------------------
+
+  _buildGrenadeViewmodel()
+  {
+    const tubeMat   = new THREE.MeshBasicMaterial({ color: 0x2a3528 });
+    const drumMat   = new THREE.MeshBasicMaterial({ color: 0x1f2a1d });
+    const accentMat = new THREE.MeshBasicMaterial({ color: 0x5a4a18 });
+    const stockMat  = new THREE.MeshBasicMaterial({ color: 0x222226 });
+    const sightMat  = new THREE.MeshBasicMaterial({ color: 0x1a1a1c });
+
+    // Fat barrel (wider/shorter than rocket)
+    const barrelGeom = new THREE.BoxGeometry(0.20, 0.20, 0.7);
+    const barrel = new THREE.Mesh(barrelGeom, tubeMat);
+    barrel.position.set(0, 0.04, -0.34);
+    this.grenadeView.add(barrel);
+
+    // Heavy muzzle ring at the front
+    const ringGeom = new THREE.BoxGeometry(0.24, 0.24, 0.06);
+    const ring = new THREE.Mesh(ringGeom, sightMat);
+    ring.position.set(0, 0.04, -0.66);
+    this.grenadeView.add(ring);
+
+    // Forward muzzle plate
+    const muzzleGeom = new THREE.BoxGeometry(0.22, 0.22, 0.04);
+    const muzzle = new THREE.Mesh(muzzleGeom, tubeMat);
+    muzzle.position.set(0, 0.04, -0.71);
+    this.grenadeView.add(muzzle);
+    this._grenadeMuzzle = muzzle;
+
+    // Curved drum magazine - cylinder rotated so the round face is visible.
+    const drumGeom = new THREE.CylinderGeometry(0.12, 0.12, 0.14, 16);
+    const drum = new THREE.Mesh(drumGeom, drumMat);
+    drum.rotation.z = Math.PI / 2;     // axis along X -> drum face shows from front
+    drum.position.set(0, -0.10, -0.06);
+    this.grenadeView.add(drum);
+
+    // Inner drum-face plate detail
+    const drumFaceGeom = new THREE.CylinderGeometry(0.07, 0.07, 0.16, 12);
+    const drumFace = new THREE.Mesh(drumFaceGeom, accentMat);
+    drumFace.rotation.z = Math.PI / 2;
+    drumFace.position.set(0, -0.10, -0.06);
+    this.grenadeView.add(drumFace);
+
+    // Top sight
+    const sightGeom = new THREE.BoxGeometry(0.04, 0.05, 0.07);
+    const sight = new THREE.Mesh(sightGeom, sightMat);
+    sight.position.set(0, 0.16, -0.32);
+    this.grenadeView.add(sight);
+
+    // Shoulder stock at the rear
+    const stockGeom = new THREE.BoxGeometry(0.10, 0.18, 0.22);
+    const stock = new THREE.Mesh(stockGeom, stockMat);
+    stock.position.set(0, -0.02, 0.20);
+    this.grenadeView.add(stock);
+
+    // Pistol grip below the receiver
+    const gripGeom = new THREE.BoxGeometry(0.06, 0.18, 0.07);
+    const grip = new THREE.Mesh(gripGeom, stockMat);
+    grip.position.set(0, -0.18, 0.06);
+    grip.rotation.x = THREE.MathUtils.degToRad(15);
+    this.grenadeView.add(grip);
+
+    this.grenadeView.traverse((m) =>
+    {
+      if (m.isMesh && m.material)
+      {
+        m.material.depthTest = false;
+        m.material.depthWrite = false;
+        m.material.transparent = false;
+        m.renderOrder = 999;
+      }
+    });
+  }
+
+  _buildGrenadeMuzzleFlash()
+  {
+    const mat = new THREE.MeshBasicMaterial({
+      map: this._flashTexture,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthTest: false,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const geom = new THREE.PlaneGeometry(0.6, 0.6);
+    this._grenadeFlash = new THREE.Mesh(geom, mat);
+    this._grenadeFlash.position.set(0, 0.04, -0.76);
+    this._grenadeFlash.visible = false;
+    this._grenadeFlash.renderOrder = 1000;
+    this.grenadeView.add(this._grenadeFlash);
+  }
+
+  // -------------------------------------------------------------------------
   // Weapon switching
   // -------------------------------------------------------------------------
 
   switchTo(name)
   {
-    if (name !== 'rifle' && name !== 'rocket') return;
+    if (name !== 'rifle' && name !== 'rocket' && name !== 'shotgun' && name !== 'grenade') return;
     if (this.current === name) return;
 
     this.current = name;
@@ -546,9 +817,14 @@ window.Game.Weapon = class
     this.firing = false;
 
     // Visibility
-    this.rifleView.visible  = (name === 'rifle');
-    this.rocketView.visible = (name === 'rocket');
-    this.viewmodel = (name === 'rifle') ? this.rifleView : this.rocketView;
+    this.rifleView.visible   = (name === 'rifle');
+    this.rocketView.visible  = (name === 'rocket');
+    this.shotgunView.visible = (name === 'shotgun');
+    this.grenadeView.visible = (name === 'grenade');
+    if      (name === 'rifle')   this.viewmodel = this.rifleView;
+    else if (name === 'rocket')  this.viewmodel = this.rocketView;
+    else if (name === 'shotgun') this.viewmodel = this.shotgunView;
+    else                          this.viewmodel = this.grenadeView;
 
     // HUD updates
     if (this.ui)
@@ -559,7 +835,11 @@ window.Game.Weapon = class
       }
       if (typeof this.ui.message === 'function')
       {
-        const label = name === 'rifle' ? 'RIFLE' : 'ROCKET LAUNCHER';
+        const label =
+          name === 'rifle'   ? 'RIFLE' :
+          name === 'rocket'  ? 'ROCKET LAUNCHER' :
+          name === 'shotgun' ? 'SHOTGUN' :
+                                'GRENADE LAUNCHER';
         this.ui.message(label, 1200);
       }
     }
@@ -574,12 +854,16 @@ window.Game.Weapon = class
     this._time += dt;
 
     // 1. Decrement per-weapon fire timers
-    if (this.rifle.fireTimer  > 0) { this.rifle.fireTimer  = Math.max(0, this.rifle.fireTimer  - dt); }
-    if (this.rocket.fireTimer > 0) { this.rocket.fireTimer = Math.max(0, this.rocket.fireTimer - dt); }
+    if (this.rifle.fireTimer   > 0) { this.rifle.fireTimer   = Math.max(0, this.rifle.fireTimer   - dt); }
+    if (this.rocket.fireTimer  > 0) { this.rocket.fireTimer  = Math.max(0, this.rocket.fireTimer  - dt); }
+    if (this.shotgun.fireTimer > 0) { this.shotgun.fireTimer = Math.max(0, this.shotgun.fireTimer - dt); }
+    if (this.grenade.fireTimer > 0) { this.grenade.fireTimer = Math.max(0, this.grenade.fireTimer - dt); }
 
     // 2. Decay muzzle flashes
-    this._tickFlash(this.rifle, this._muzzleFlash, dt);
-    this._tickFlash(this.rocket, this._rocketFlash, dt);
+    this._tickFlash(this.rifle,   this._muzzleFlash,  dt);
+    this._tickFlash(this.rocket,  this._rocketFlash,  dt);
+    this._tickFlash(this.shotgun, this._shotgunFlash, dt);
+    this._tickFlash(this.grenade, this._grenadeFlash, dt);
 
     // 3. Sway / kick on the active viewmodel
     let bobX = 0, bobY = 0;
@@ -601,26 +885,39 @@ window.Game.Weapon = class
       }
     }
 
-    // Decay kick on both weapons (so a switch mid-recoil settles too)
+    // Decay kick on all weapons (so a switch mid-recoil settles too)
     this._decayKick(this.rifle, dt);
     this._decayKick(this.rocket, dt);
+    this._decayKick(this.shotgun, dt);
+    this._decayKick(this.grenade, dt);
 
     // Apply pose to active viewmodel
     if (this.current === 'rifle')
     {
       this._applyPose(this.rifleView, this._rifleRest, this.rifle.kick, bobX, bobY);
     }
-    else
+    else if (this.current === 'rocket')
     {
       // Rocket has chunkier recoil feel
       this._applyPose(this.rocketView, this._rocketRest, this.rocket.kick, bobX, bobY, 0.10, 0.03, 0.25);
+    }
+    else if (this.current === 'shotgun')
+    {
+      // Shotgun: heavy kick (a bit more back than rifle)
+      this._applyPose(this.shotgunView, this._shotgunRest, this.shotgun.kick, bobX, bobY, 0.09, 0.025, 0.22);
+    }
+    else
+    {
+      // Grenade launcher: chunky like rocket but a touch less
+      this._applyPose(this.grenadeView, this._grenadeRest, this.grenade.kick, bobX, bobY, 0.09, 0.025, 0.22);
     }
 
     // 4. Update lingering effects (impacts, blood, tracers, explosions, smoke, lights)
     this._updateEffects(dt);
 
-    // 5. Simulate in-flight rockets
+    // 5. Simulate in-flight rockets and grenades
     this._updateRockets(dt, ctx);
+    this._updateGrenades(dt, ctx);
 
     // 6. Decay camera shake
     if (this.cameraShake.duration > 0)
@@ -641,7 +938,7 @@ window.Game.Weapon = class
     // 7. Auto-fire while held
     if (this.firing)
     {
-      const w = this.current === 'rocket' ? this.rocket : this.rifle;
+      const w = this._activeWeapon();
       if (w.fireTimer <= 0 && w.ammo > 0)
       {
         this.fire(ctx);
@@ -803,14 +1100,10 @@ window.Game.Weapon = class
 
   fire(ctx)
   {
-    if (this.current === 'rocket')
-    {
-      this._fireRocket(ctx);
-    }
-    else
-    {
-      this._fireRifle(ctx);
-    }
+    if      (this.current === 'rocket')  this._fireRocket(ctx);
+    else if (this.current === 'shotgun') this._fireShotgun(ctx);
+    else if (this.current === 'grenade') this._fireGrenade(ctx);
+    else                                  this._fireRifle(ctx);
   }
 
   // -------------------------------------------------------------------------
@@ -1120,9 +1413,17 @@ window.Game.Weapon = class
     }
   }
 
+  // Wrapper kept for backwards compat - calls the generic splash with rocket stats.
   _detonateRocket(point, ctx, directHitEnemy, directHitPeerId)
   {
-    const radius = this.rocket.splashRadius;
+    this._detonateSplash(point, ctx, directHitEnemy, directHitPeerId, this.rocket);
+  }
+
+  // Generic explosion: splashes all entities within stats.splashRadius using
+  // stats.splashDamage and stats.selfDamageScale.  Used by rockets and grenades.
+  _detonateSplash(point, ctx, directHitEnemy, directHitPeerId, stats)
+  {
+    const radius = stats.splashRadius;
     const radiusSq = radius * radius;
 
     // ---- Splash damage to remote players (PvP) ---------------------------
@@ -1140,7 +1441,7 @@ window.Game.Weapon = class
         if (d2 > radiusSq) return;
         const d = Math.sqrt(Math.max(0, d2));
         const falloff = 1 - (d / radius);
-        let dmg = this.rocket.splashDamage * falloff;
+        let dmg = stats.splashDamage * falloff;
         if (peerId === directHitPeerId) dmg *= 0.25;
         if (dmg > 0) {
           try { ctx.network.sendHit(peerId, dmg); } catch (e) { /* ignore */ }
@@ -1165,9 +1466,8 @@ window.Game.Weapon = class
 
         const d = Math.sqrt(Math.max(0, d2));
         const falloff = 1 - (d / radius);
-        let dmg = this.rocket.splashDamage * falloff;
-        // Don't double-damage the directly-hit enemy on top of the 90 direct.
-        // We already applied direct damage above; reduce splash on them.
+        let dmg = stats.splashDamage * falloff;
+        // Don't double-damage the directly-hit enemy on top of the direct.
         if (en === directHitEnemy)
         {
           dmg *= 0.25;
@@ -1184,8 +1484,6 @@ window.Game.Weapon = class
           const nx = ex * inv;
           const ny = ey * inv;
           const nz = ez * inv;
-          // Negative because (ex,ey,ez) goes from explosion -> enemy already.
-          // Wait - that's already outward. So push along (nx,ny,nz).
           const impulse = 8 * falloff;
           en.velocity.x += nx * impulse;
           en.velocity.y += Math.max(2, ny * impulse + 3);  // a little vertical pop
@@ -1198,8 +1496,7 @@ window.Game.Weapon = class
     if (ctx && ctx.player && !ctx.player.dead)
     {
       const p = ctx.player;
-      // Player eye is at p.position; account for body height (feet ~ p.position.y - 1.7).
-      // Use a body centre roughly 0.85 below eye.
+      // Player eye is at p.position; body centre roughly 0.85 below eye.
       const cx = p.position.x;
       const cy = p.position.y - 0.85;
       const cz = p.position.z;
@@ -1214,8 +1511,8 @@ window.Game.Weapon = class
         const d = Math.sqrt(Math.max(0.0001, d2));
         const falloff = 1 - (d / radius);
 
-        // Self damage scaled so rocket-jumping is survivable
-        const dmg = this.rocket.splashDamage * falloff * this.rocket.selfDamageScale;
+        // Self damage scaled so self-jumping is survivable
+        const dmg = stats.splashDamage * falloff * stats.selfDamageScale;
         if (dmg > 0 && typeof p.takeDamage === 'function')
         {
           try { p.takeDamage(dmg); } catch (e) { /* ignore */ }
@@ -1224,7 +1521,6 @@ window.Game.Weapon = class
         // Knockback impulse - separate vertical kick + horizontal push.
         if (p.velocity)
         {
-          // Horizontal direction (normalized in XZ plane).
           let hx = ex, hz = ez;
           const hLen = Math.sqrt(hx*hx + hz*hz);
           if (hLen > 1e-4)
@@ -1237,28 +1533,21 @@ window.Game.Weapon = class
             hx = 0; hz = 0;
           }
 
-          // Tuned for ~3x jump height when firing at the floor while jumping.
-          // Player jumpImpulse=8, gravity=25 -> normal jump apex ~1.28m.
-          // 3x apex ~3.84m -> need v ~ sqrt(2*g*h) ~ sqrt(192) ~ 13.86 -> impulseY ~14.
-          // Add to existing velocity so a jump+rocket stacks.
           const impulseY    = 14 * falloff;
           const impulseHoriz = 9 * falloff;
 
-          // Bias the vertical component up a little even if explosion is below.
-          // If the explosion is below the player (point.y < cy), ey>0 -> up boost natural.
-          // If above, we still give *some* up kick (clamped) so floor-rockets always pop you.
           const upKick = Math.max(impulseY * 0.85, impulseY * (ey > 0 ? 1 : 0.5));
 
           p.velocity.y += upKick;
           p.velocity.x += hx * impulseHoriz;
           p.velocity.z += hz * impulseHoriz;
 
-          // Player is no longer grounded after a rocket jump
+          // Player is no longer grounded after a splash jump
           p.onGround = false;
         }
 
         // Stronger camera shake when close
-        const proximity = 1 - (d / radius);  // 1 at centre, 0 at edge
+        const proximity = 1 - (d / radius);
         this._addShake(0.25 + 0.55 * proximity, 0.4 + 0.2 * proximity);
       }
       else
@@ -1491,6 +1780,343 @@ window.Game.Weapon = class
       kind: 'smoke',
       startScale: 1,
     });
+  }
+
+  // -------------------------------------------------------------------------
+  // Shotgun - hitscan, multi-pellet cone
+  // -------------------------------------------------------------------------
+
+  _fireShotgun(ctx)
+  {
+    if (this.shotgun.ammo <= 0) return;
+
+    this.shotgun.fireTimer = this.shotgun.fireRate;
+    this.shotgun.ammo--;   // one shell consumed (regardless of pellet count)
+
+    this.camera.getWorldPosition(this._origin);
+    const baseDir = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion).normalize();
+
+    // Build an orthonormal basis from the camera so we can offset within the cone.
+    // Pick an arbitrary up that isn't colinear with baseDir.
+    const upRef = Math.abs(baseDir.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+    const right = new THREE.Vector3().crossVectors(baseDir, upRef).normalize();
+    const up    = new THREE.Vector3().crossVectors(right, baseDir).normalize();
+
+    const targets = this._gatherTargets(ctx);
+    const muzzlePos = new THREE.Vector3();
+    this._shotgunMuzzle.getWorldPosition(muzzlePos);
+
+    const spread = this.shotgun.spread;
+    const pellets = this.shotgun.pellets;
+
+    for (let i = 0; i < pellets; i++)
+    {
+      // Random offset in a disk -> approximate cone direction.
+      const r  = Math.sqrt(Math.random()) * spread;
+      const th = Math.random() * Math.PI * 2;
+      const ox = Math.cos(th) * r;
+      const oy = Math.sin(th) * r;
+
+      const dir = baseDir.clone()
+        .add(right.clone().multiplyScalar(ox))
+        .add(up.clone().multiplyScalar(oy))
+        .normalize();
+
+      this.raycaster.set(this._origin, dir);
+      this.raycaster.near = 0;
+      this.raycaster.far = this.shotgun.maxRange;
+      const hits = this.raycaster.intersectObjects(targets, false);
+
+      let hitPoint = null;
+      if (hits.length > 0)
+      {
+        const h = hits[0];
+        hitPoint = h.point;
+        const ud = h.object && h.object.userData ? h.object.userData : null;
+        const enemyRef = ud ? ud.enemyRef : null;
+        const peerId   = ud ? ud.peerId   : null;
+
+        if (enemyRef && enemyRef.alive && typeof enemyRef.takeDamage === 'function')
+        {
+          try { enemyRef.takeDamage(this.shotgun.damage, h.point); } catch (e) { /* ignore */ }
+          this._spawnBlood(h.point);
+        }
+        else if (peerId && ctx && ctx.network && typeof ctx.network.sendHit === 'function')
+        {
+          try { ctx.network.sendHit(peerId, this.shotgun.damage); } catch (e) { /* ignore */ }
+          this._spawnBlood(h.point);
+        }
+        else
+        {
+          this._spawnImpact(h.point, h.face ? h.face.normal : null, h.object);
+        }
+      }
+
+      const tracerEnd = hitPoint
+        ? hitPoint.clone()
+        : this._origin.clone().add(dir.clone().multiplyScalar(this.shotgun.maxRange));
+      this._spawnPelletTracer(muzzlePos, tracerEnd);
+    }
+
+    this.shotgun.flashT = 0.09;
+    this._shotgunFlash.rotation.z = Math.random() * Math.PI * 2;
+    this.shotgun.kick = 1;
+
+    this._setHudAmmo(ctx);
+  }
+
+  // Thin tracer line from muzzle to (per-pellet) end point.
+  _spawnPelletTracer(muzzlePos, endPoint)
+  {
+    const positions = new Float32Array([
+      muzzlePos.x, muzzlePos.y, muzzlePos.z,
+      endPoint.x,  endPoint.y,  endPoint.z,
+    ]);
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+    const mat = new THREE.LineBasicMaterial({
+      color: 0xffe6a0,
+      transparent: true,
+      opacity: 0.7,
+      blending: THREE.AdditiveBlending,
+      depthTest: true,
+      depthWrite: false,
+    });
+    const line = new THREE.Line(geom, mat);
+    line.renderOrder = 800;
+    this.scene.add(line);
+    this._addEffect({ mesh: line, t: 0, ttl: 0.06, kind: 'tracer' });
+  }
+
+  // -------------------------------------------------------------------------
+  // Grenade launcher - arcing projectile, bounces, splash detonates
+  // -------------------------------------------------------------------------
+
+  _fireGrenade(ctx)
+  {
+    if (this.grenade.ammo <= 0) return;
+
+    this.grenade.fireTimer = this.grenade.fireRate;
+    this.grenade.ammo--;
+
+    // Spawn position: grenade muzzle world-space.
+    const spawn = new THREE.Vector3();
+    this._grenadeMuzzle.getWorldPosition(spawn);
+
+    // Direction: camera forward.
+    const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion).normalize();
+
+    // Build the projectile mesh - green glowing sphere.
+    const projGroup = new THREE.Group();
+
+    const bodyGeom = new THREE.SphereGeometry(0.10, 14, 10);
+    const bodyMat  = new THREE.MeshBasicMaterial({ color: 0x55ff66 });
+    const body     = new THREE.Mesh(bodyGeom, bodyMat);
+    projGroup.add(body);
+
+    // Outer glow halo (camera-facing plane)
+    const haloGeom = new THREE.PlaneGeometry(0.36, 0.36);
+    const haloMat  = new THREE.MeshBasicMaterial({
+      map: this._sparkTexture,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthTest: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      color: 0x66ff88,
+      opacity: 0.85,
+    });
+    const halo = new THREE.Mesh(haloGeom, haloMat);
+    projGroup.add(halo);
+
+    projGroup.position.copy(spawn);
+    projGroup.userData.isProjectile = true;
+    projGroup.traverse((m) =>
+    {
+      if (m.isMesh) m.userData.isProjectile = true;
+    });
+
+    this.scene.add(projGroup);
+
+    this.grenades.push({
+      mesh: projGroup,
+      halo: halo,
+      pos: spawn.clone(),
+      prevPos: spawn.clone(),
+      vel: dir.clone().multiplyScalar(this.grenade.projectileSpeed),
+      bouncesLeft: this.grenade.maxBounces,
+      lifetime: 0,
+      smokeTimer: 0,
+      alive: true,
+    });
+
+    // Muzzle flash + kick
+    this.grenade.flashT = 0.09;
+    this._grenadeFlash.rotation.z = Math.random() * Math.PI * 2;
+    this.grenade.kick = 1;
+
+    this._setHudAmmo(ctx);
+  }
+
+  _updateGrenades(dt, ctx)
+  {
+    if (this.grenades.length === 0) return;
+
+    const gStats = this.grenade;
+
+    for (let i = this.grenades.length - 1; i >= 0; i--)
+    {
+      const g = this.grenades[i];
+      if (!g.alive)
+      {
+        // dispose
+        if (g.mesh && g.mesh.parent) g.mesh.parent.remove(g.mesh);
+        g.mesh && g.mesh.traverse && g.mesh.traverse((m) =>
+        {
+          if (m.isMesh)
+          {
+            if (m.material && m.material.dispose) m.material.dispose();
+            if (m.geometry && m.geometry.dispose) m.geometry.dispose();
+          }
+        });
+        this.grenades.splice(i, 1);
+        continue;
+      }
+
+      // Apply gravity
+      g.vel.y -= gStats.gravity * dt;
+
+      // Advance
+      g.prevPos.copy(g.pos);
+      g.pos.x += g.vel.x * dt;
+      g.pos.y += g.vel.y * dt;
+      g.pos.z += g.vel.z * dt;
+      const stepLen = g.prevPos.distanceTo(g.pos);
+      g.lifetime += dt;
+
+      // Apply to mesh
+      g.mesh.position.copy(g.pos);
+      // Make the halo face the camera for a nice glow.
+      if (g.halo)
+      {
+        const camPos = this.camera.getWorldPosition(this._tmpVec);
+        g.halo.lookAt(camPos);
+      }
+
+      // Smoke trail
+      g.smokeTimer -= dt;
+      if (g.smokeTimer <= 0)
+      {
+        g.smokeTimer = 0.05;
+        this._spawnSmokePuff(g.pos);
+      }
+
+      // Collision: raycast prev->new against level + alive enemy meshes + remote players
+      let detonateAt = null;
+      let bounceAt   = null;
+      let bounceNormal = null;
+      let hitEnemy = null;
+      let hitPeerId = null;
+
+      if (stepLen > 1e-6)
+      {
+        const targets = this._gatherTargets(ctx);
+        const segDir = this._tmpVec.copy(g.pos).sub(g.prevPos).normalize();
+        this.raycaster.set(g.prevPos, segDir);
+        this.raycaster.near = 0;
+        this.raycaster.far = stepLen + 0.001;
+        const hits = this.raycaster.intersectObjects(targets, false);
+        for (let h = 0; h < hits.length; h++)
+        {
+          const ud = hits[h].object && hits[h].object.userData ? hits[h].object.userData : null;
+          if (ud && ud.isProjectile) continue;
+
+          const enemyRef = ud ? ud.enemyRef : null;
+          const peerId   = ud ? ud.peerId   : null;
+
+          if (enemyRef && enemyRef.alive)
+          {
+            // Direct contact with enemy -> detonate immediately
+            detonateAt = hits[h].point.clone();
+            hitEnemy = enemyRef;
+          }
+          else if (peerId)
+          {
+            // Direct contact with remote player -> detonate immediately
+            detonateAt = hits[h].point.clone();
+            hitPeerId = peerId;
+          }
+          else
+          {
+            // Wall/floor -> bounce (or detonate if bounces exhausted)
+            bounceAt = hits[h].point.clone();
+            // Compute world-space normal from face normal
+            if (hits[h].face && hits[h].object)
+            {
+              bounceNormal = hits[h].face.normal.clone();
+              const nm = new THREE.Matrix3().getNormalMatrix(hits[h].object.matrixWorld);
+              bounceNormal.applyMatrix3(nm).normalize();
+            }
+            else
+            {
+              bounceNormal = segDir.clone().multiplyScalar(-1);
+            }
+          }
+          break;
+        }
+      }
+
+      // Force detonation if lifetime exceeded
+      if (!detonateAt && !bounceAt && g.lifetime > gStats.maxLifetime)
+      {
+        detonateAt = g.pos.clone();
+      }
+
+      if (detonateAt)
+      {
+        // Direct hit damage to enemy/peer struck
+        if (hitEnemy && hitEnemy.alive && typeof hitEnemy.takeDamage === 'function')
+        {
+          try { hitEnemy.takeDamage(gStats.damage, detonateAt); } catch (e) { /* ignore */ }
+          this._spawnBlood(detonateAt);
+        }
+        else if (hitPeerId && ctx && ctx.network && typeof ctx.network.sendHit === 'function')
+        {
+          try { ctx.network.sendHit(hitPeerId, gStats.damage); } catch (e) { /* ignore */ }
+          this._spawnBlood(detonateAt);
+        }
+
+        this._detonateSplash(detonateAt, ctx, hitEnemy, hitPeerId, gStats);
+        g.alive = false;
+        continue;
+      }
+
+      if (bounceAt)
+      {
+        if (g.bouncesLeft <= 0)
+        {
+          // Out of bounces -> detonate at the contact point
+          this._detonateSplash(bounceAt, ctx, null, null, gStats);
+          g.alive = false;
+          continue;
+        }
+
+        // Reflect velocity off the surface normal and apply lossy scale.
+        // r = v - 2*(v.n)*n
+        const v = g.vel;
+        const n = bounceNormal;
+        const dot = v.x * n.x + v.y * n.y + v.z * n.z;
+        v.x = (v.x - 2 * dot * n.x) * gStats.bounceLoss;
+        v.y = (v.y - 2 * dot * n.y) * gStats.bounceLoss;
+        v.z = (v.z - 2 * dot * n.z) * gStats.bounceLoss;
+
+        // Place the grenade just off the surface so it doesn't immediately re-hit.
+        g.pos.copy(bounceAt).add(n.clone().multiplyScalar(0.05));
+        g.mesh.position.copy(g.pos);
+        g.bouncesLeft--;
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
