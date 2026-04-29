@@ -154,6 +154,122 @@ window.Game.Weapon = class
       this._tracerPool.push(g);
     }
 
+    // ---- Shared per-kind material pools (perf) ---------------------------
+    // Every transient effect (impact, blood, explosion sprite, spark, smoke,
+    // tracer) used to allocate a fresh MeshBasicMaterial / LineBasicMaterial
+    // per call.  A single shotgun shell (8 pellets * (impact+tracer)) plus
+    // an explosion (sprite + 25 sparks + light + smoke) easily produces
+    // 30-60 fresh materials per shot - cheap individually but a major source
+    // of GC pressure and hitchy frames.
+    //
+    // We round-robin through a pool of N pre-allocated materials per kind,
+    // skipping disposal of pooled materials in `_disposeFx` (sharedMat flag).
+    // Pool size is chosen >= max simultaneous in-flight effects of that kind
+    // so that two co-existing effects of the same kind do not collide on a
+    // shared `material.opacity` mutation.
+    //
+    // Pool sizes:
+    //   spark    : 32 (one explosion = 25 simultaneously)
+    //   impact   : 32 (one shotgun shell can spawn up to 8 impacts on walls)
+    //   blood    : 32
+    //   smoke    : 32 (rocket + grenade trails; up to ~25 puffs/sec)
+    //   explosion: 4  (0.55s ttl sprite, only 1-2 simultaneous typical)
+    //   tracerR  : 32 (rifle tracer line material)
+    //   tracerS  : 32 (shotgun-pellet tracer line material)
+    this._matPoolSize = 32;
+    this._matPools = {
+      impact:    this._buildMatPool(this._matPoolSize, () => new THREE.MeshBasicMaterial({
+        map: this._impactTexture,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthTest: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        opacity: 1,
+      })),
+      blood:     this._buildMatPool(this._matPoolSize, () => new THREE.MeshBasicMaterial({
+        map: this._bloodTexture,
+        transparent: true,
+        blending: THREE.NormalBlending,
+        depthTest: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        opacity: 1,
+        color: 0xff6655,
+      })),
+      explosion: this._buildMatPool(4, () => new THREE.MeshBasicMaterial({
+        map: this._explosionTexture,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthTest: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        opacity: 1,
+      })),
+      // Sparks: half are warm-orange, half pale yellow.  We keep two sub-pools
+      // and round-robin within each so explosions still get the bi-colour mix.
+      sparkWarm: this._buildMatPool(this._matPoolSize, () => new THREE.MeshBasicMaterial({
+        map: this._sparkTexture,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthTest: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        opacity: 1,
+        color: 0xffaa44,
+      })),
+      sparkCool: this._buildMatPool(this._matPoolSize, () => new THREE.MeshBasicMaterial({
+        map: this._sparkTexture,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthTest: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        opacity: 1,
+        color: 0xffe080,
+      })),
+      smoke:     this._buildMatPool(this._matPoolSize, () => new THREE.MeshBasicMaterial({
+        map: this._smokeTexture,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthTest: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        opacity: 0.6,
+        color: 0xffaa66,
+      })),
+      tracerRifle:  this._buildMatPool(this._matPoolSize, () => new THREE.LineBasicMaterial({
+        color: 0xfff0c0,
+        transparent: true,
+        opacity: 0.85,
+        blending: THREE.AdditiveBlending,
+        depthTest: true,
+        depthWrite: false,
+      })),
+      tracerPellet: this._buildMatPool(this._matPoolSize, () => new THREE.LineBasicMaterial({
+        color: 0xffe6a0,
+        transparent: true,
+        opacity: 0.7,
+        blending: THREE.AdditiveBlending,
+        depthTest: true,
+        depthWrite: false,
+      })),
+    };
+
+    // ---- Pooled point-lights for explosions ------------------------------
+    // PointLights are noticeably more expensive than materials. We keep a
+    // small pool, mark them invisible (intensity 0) when free, and reset
+    // intensity/position/decay when claimed.
+    this._lightPoolSize = 4;
+    this._lightPool = [];
+    for (let i = 0; i < this._lightPoolSize; i++)
+    {
+      const l = new THREE.PointLight(0xff7733, 0, 12, 2);
+      l.visible = false;
+      this.scene.add(l);
+      this._lightPool.push({ light: l, inUse: false });
+    }
+
     // ---- Build viewmodels (parented to camera) ---------------------------
     // Rifle viewmodel
     this.rifleView = new THREE.Group();
@@ -1098,14 +1214,67 @@ window.Game.Weapon = class
     this.effects.push(fx);
   }
 
+  // Build a round-robin material pool of `n` materials, each created via
+  // `factory()`. Returns { mats, idx, next() }.
+  _buildMatPool(n, factory)
+  {
+    const mats = new Array(n);
+    for (let i = 0; i < n; i++) mats[i] = factory();
+    return { mats, idx: 0 };
+  }
+
+  // Pull the next material out of a pool (round-robin). Marks the effect
+  // as having a shared material so disposal skips dispose().
+  _nextPoolMat(pool)
+  {
+    const m = pool.mats[pool.idx];
+    pool.idx = (pool.idx + 1) % pool.mats.length;
+    return m;
+  }
+
+  // Acquire a pooled point-light; returns null if all are in use (caller
+  // should silently skip light spawn in that case).
+  _acquireLight()
+  {
+    for (let i = 0; i < this._lightPool.length; i++)
+    {
+      const slot = this._lightPool[i];
+      if (!slot.inUse)
+      {
+        slot.inUse = true;
+        slot.light.visible = true;
+        return slot;
+      }
+    }
+    return null;
+  }
+
+  _releaseLight(slot)
+  {
+    if (!slot) return;
+    slot.inUse = false;
+    slot.light.intensity = 0;
+    slot.light.visible = false;
+  }
+
   _disposeFx(fx)
   {
     if (!fx) return;
+    // Pooled lights: don't remove from scene, just release the slot.
+    if (fx.kind === 'light' && fx.lightSlot)
+    {
+      this._releaseLight(fx.lightSlot);
+      return;
+    }
     if (fx.mesh && fx.mesh.parent)
     {
       fx.mesh.parent.remove(fx.mesh);
     }
-    if (fx.mesh && fx.mesh.material && fx.mesh.material.dispose)
+    // Skip material disposal for pooled materials (sharedMat flag). For
+    // pooled materials we also reset opacity so the next consumer of the
+    // round-robin slot starts at full visibility (the spawner will set the
+    // initial opacity explicitly anyway, but this keeps things tidy).
+    if (fx.mesh && fx.mesh.material && fx.mesh.material.dispose && !fx.sharedMat)
     {
       fx.mesh.material.dispose();
     }
@@ -1650,15 +1819,8 @@ window.Game.Weapon = class
 
   _spawnImpact(point, faceNormal, hitObject)
   {
-    const mat = new THREE.MeshBasicMaterial({
-      map: this._impactTexture,
-      transparent: true,
-      blending: THREE.AdditiveBlending,
-      depthTest: true,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-      opacity: 1,
-    });
+    const mat = this._nextPoolMat(this._matPools.impact);
+    mat.opacity = 1;
     // Reuse the shared unit-plane geometry; size via mesh.scale (0.35).
     const mesh = new THREE.Mesh(this._unitPlaneGeom, mat);
     mesh.scale.set(0.35, 0.35, 1);
@@ -1689,21 +1851,13 @@ window.Game.Weapon = class
 
     this.scene.add(mesh);
     // startScale 0.35 = original PlaneGeometry(0.35,0.35) size with unit-plane share.
-    this._addEffect({ mesh, t: 0, ttl: 0.5, kind: 'impact', startScale: 0.35, sharedGeom: true });
+    this._addEffect({ mesh, t: 0, ttl: 0.5, kind: 'impact', startScale: 0.35, sharedGeom: true, sharedMat: true });
   }
 
   _spawnBlood(point)
   {
-    const mat = new THREE.MeshBasicMaterial({
-      map: this._bloodTexture,
-      transparent: true,
-      blending: THREE.NormalBlending,
-      depthTest: true,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-      opacity: 1,
-      color: 0xff6655,
-    });
+    const mat = this._nextPoolMat(this._matPools.blood);
+    mat.opacity = 1;
     // Reuse shared unit-plane geometry; original size 0.4 emulated via startScale.
     const mesh = new THREE.Mesh(this._unitPlaneGeom, mat);
     mesh.scale.set(0.4, 0.4, 1);
@@ -1714,7 +1868,7 @@ window.Game.Weapon = class
     mesh.rotation.z = Math.random() * Math.PI * 2;
 
     this.scene.add(mesh);
-    this._addEffect({ mesh, t: 0, ttl: 0.4, kind: 'blood', startScale: 0.4, sharedGeom: true });
+    this._addEffect({ mesh, t: 0, ttl: 0.4, kind: 'blood', startScale: 0.4, sharedGeom: true, sharedMat: true });
   }
 
   _spawnTracer(endPoint)
@@ -1730,32 +1884,19 @@ window.Game.Weapon = class
     arr[3] = endPoint.x;  arr[4] = endPoint.y;  arr[5] = endPoint.z;
     geom.attributes.position.needsUpdate = true;
 
-    const mat = new THREE.LineBasicMaterial({
-      color: 0xfff0c0,
-      transparent: true,
-      opacity: 0.85,
-      blending: THREE.AdditiveBlending,
-      depthTest: true,
-      depthWrite: false,
-    });
+    const mat = this._nextPoolMat(this._matPools.tracerRifle);
+    mat.opacity = 0.85;
     const line = new THREE.Line(geom, mat);
     line.renderOrder = 800;
     line.frustumCulled = false; // bounds aren't updated since we share the buffer
     this.scene.add(line);
-    this._addEffect({ mesh: line, t: 0, ttl: 0.06, kind: 'tracer', sharedGeom: true });
+    this._addEffect({ mesh: line, t: 0, ttl: 0.06, kind: 'tracer', sharedGeom: true, sharedMat: true });
   }
 
   _spawnExplosionSprite(point)
   {
-    const mat = new THREE.MeshBasicMaterial({
-      map: this._explosionTexture,
-      transparent: true,
-      blending: THREE.AdditiveBlending,
-      depthTest: true,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-      opacity: 1,
-    });
+    const mat = this._nextPoolMat(this._matPools.explosion);
+    mat.opacity = 1;
     // Reuse the shared unit-plane geometry; explosion update sets scale per-frame.
     const mesh = new THREE.Mesh(this._unitPlaneGeom, mat);
     mesh.renderOrder = 850;
@@ -1763,24 +1904,19 @@ window.Game.Weapon = class
     mesh.scale.setScalar(0.5);
 
     this.scene.add(mesh);
-    this._addEffect({ mesh, t: 0, ttl: 0.55, kind: 'explosion', sharedGeom: true });
+    this._addEffect({ mesh, t: 0, ttl: 0.55, kind: 'explosion', sharedGeom: true, sharedMat: true });
   }
 
   _spawnExplosionParticles(point)
   {
     const count = 25;
+    const warmCutoff = count * 0.6;  // first 60% warm, rest cool
     for (let i = 0; i < count; i++)
     {
-      const mat = new THREE.MeshBasicMaterial({
-        map: this._sparkTexture,
-        transparent: true,
-        blending: THREE.AdditiveBlending,
-        depthTest: true,
-        depthWrite: false,
-        side: THREE.DoubleSide,
-        opacity: 1,
-        color: i < count * 0.6 ? 0xffaa44 : 0xffe080,
-      });
+      // Pull from the warm or cool spark sub-pool to preserve the bi-colour mix.
+      const pool = i < warmCutoff ? this._matPools.sparkWarm : this._matPools.sparkCool;
+      const mat  = this._nextPoolMat(pool);
+      mat.opacity = 1;
       // Reuse shared unit-plane; original per-spark size becomes startScale.
       const size = 0.15 + Math.random() * 0.15;
       const mesh = new THREE.Mesh(this._unitPlaneGeom, mat);
@@ -1804,6 +1940,7 @@ window.Game.Weapon = class
         kind: 'spark',
         startScale: size,
         sharedGeom: true,
+        sharedMat: true,
         vel: new THREE.Vector3(vx, vy, vz),
       });
     }
@@ -1811,11 +1948,17 @@ window.Game.Weapon = class
 
   _spawnExplosionLight(point)
   {
-    const light = new THREE.PointLight(0xff7733, 5, 12, 2);
+    const slot = this._acquireLight();
+    if (!slot) return;   // all lights busy - skip rather than allocate a fresh one
+    const light = slot.light;
+    light.color.setHex(0xff7733);
+    light.distance = 12;
+    light.decay = 2;
+    light.intensity = 5;
     light.position.copy(point);
-    this.scene.add(light);
     this._addEffect({
       mesh: light,
+      lightSlot: slot,
       t: 0,
       ttl: 0.25,
       kind: 'light',
@@ -1825,16 +1968,8 @@ window.Game.Weapon = class
 
   _spawnSmokePuff(pos)
   {
-    const mat = new THREE.MeshBasicMaterial({
-      map: this._smokeTexture,
-      transparent: true,
-      blending: THREE.AdditiveBlending,
-      depthTest: true,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-      opacity: 0.6,
-      color: 0xffaa66,
-    });
+    const mat = this._nextPoolMat(this._matPools.smoke);
+    mat.opacity = 0.6;
     // Reuse shared unit-plane; size becomes startScale.
     const size = 0.25 + Math.random() * 0.15;
     const mesh = new THREE.Mesh(this._unitPlaneGeom, mat);
@@ -1853,6 +1988,7 @@ window.Game.Weapon = class
       kind: 'smoke',
       startScale: size,
       sharedGeom: true,
+      sharedMat: true,
     });
   }
 
@@ -1968,19 +2104,13 @@ window.Game.Weapon = class
     arr[3] = endPoint.x;  arr[4] = endPoint.y;  arr[5] = endPoint.z;
     geom.attributes.position.needsUpdate = true;
 
-    const mat = new THREE.LineBasicMaterial({
-      color: 0xffe6a0,
-      transparent: true,
-      opacity: 0.7,
-      blending: THREE.AdditiveBlending,
-      depthTest: true,
-      depthWrite: false,
-    });
+    const mat = this._nextPoolMat(this._matPools.tracerPellet);
+    mat.opacity = 0.7;
     const line = new THREE.Line(geom, mat);
     line.renderOrder = 800;
     line.frustumCulled = false;
     this.scene.add(line);
-    this._addEffect({ mesh: line, t: 0, ttl: 0.06, kind: 'tracer', sharedGeom: true });
+    this._addEffect({ mesh: line, t: 0, ttl: 0.06, kind: 'tracer', sharedGeom: true, sharedMat: true });
   }
 
   // -------------------------------------------------------------------------
