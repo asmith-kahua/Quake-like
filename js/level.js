@@ -271,61 +271,157 @@ window.Game.Level = class
 
   _makeStoneCanvas(size, baseRGB, darkRGB, noiseAmount)
   {
+    // Goal: produce a 4x4 stone-block tile whose STRUCTURE survives heavy
+    // mipmap minification on long floors / big walls. Earlier revisions
+    // leaned on dense per-pixel noise + 1px mortar lines; once minified to
+    // mip levels 4-6 those features averaged into a uniform grey smear and
+    // the surface read as "stretched". The new layout instead emphasizes:
+    //
+    //   * Per-stone base tone (each of the 16 cells is given a +/-12% jitter
+    //     from the base color) -> stones stay distinguishable at distance.
+    //   * Crisp 3px mortar joints with a 1px lighter highlight along the
+    //     top/left edge of each cell, faking a shallow bevel. Thicker lines
+    //     survive several mip levels before fading.
+    //   * A few large dark blotches per stone (weathering) painted *inside*
+    //     each cell, scaled to the cell so they average down to per-stone
+    //     tone variation rather than canvas-wide blobs.
+    //   * A reduced low-amplitude per-pixel noise (about half the previous
+    //     amplitude) for surface grain, kept low so it doesn't wash out the
+    //     structural cues above.
     const canvas = document.createElement('canvas');
     canvas.width = size;
     canvas.height = size;
     const ctx = canvas.getContext('2d');
 
-    ctx.fillStyle = `rgb(${baseRGB[0]},${baseRGB[1]},${baseRGB[2]})`;
-    ctx.fillRect(0, 0, size, size);
-
-    const img = ctx.getImageData(0, 0, size, size);
-    const data = img.data;
-    for (let i = 0; i < data.length; i += 4)
-    {
-      const n = (Math.random() - 0.5) * 2 * noiseAmount;
-      data[i  ] = Math.max(0, Math.min(255, data[i  ] + n * (baseRGB[0] - darkRGB[0])));
-      data[i+1] = Math.max(0, Math.min(255, data[i+1] + n * (baseRGB[1] - darkRGB[1])));
-      data[i+2] = Math.max(0, Math.min(255, data[i+2] + n * (baseRGB[2] - darkRGB[2])));
-    }
-    ctx.putImageData(img, 0, 0);
-
-    ctx.globalAlpha = 0.35;
-    for (let i = 0; i < 14; i++)
-    {
-      const x = Math.random() * size;
-      const y = Math.random() * size;
-      const r = 4 + Math.random() * 12;
-      ctx.fillStyle = `rgb(${darkRGB[0]},${darkRGB[1]},${darkRGB[2]})`;
-      ctx.beginPath();
-      ctx.arc(x, y, r, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    ctx.globalAlpha = 0.55;
-    ctx.strokeStyle = `rgb(${Math.floor(darkRGB[0]*0.6)},${Math.floor(darkRGB[1]*0.6)},${Math.floor(darkRGB[2]*0.6)})`;
-    ctx.lineWidth = 1;
     const cols = 4;
     const rows = 4;
     const cw = size / cols;
     const rh = size / rows;
+
+    // Helpers: clamp byte, lerp between baseRGB and darkRGB by t in [0,1]
+    // (t=0 -> base, t=1 -> dark). Returned as a CSS rgb() string.
+    const clamp8 = v => Math.max(0, Math.min(255, v | 0));
+    const mixColor = (t) =>
+    {
+      const r = baseRGB[0] + (darkRGB[0] - baseRGB[0]) * t;
+      const g = baseRGB[1] + (darkRGB[1] - baseRGB[1]) * t;
+      const b = baseRGB[2] + (darkRGB[2] - baseRGB[2]) * t;
+      return `rgb(${clamp8(r)},${clamp8(g)},${clamp8(b)})`;
+    };
+    const mixColorJitter = (t, jitter) =>
+    {
+      // jitter is signed in [-1,1], shifts t toward dark/light by `jitter*0.12`.
+      return mixColor(Math.max(0, Math.min(1, t + jitter * 0.12)));
+    };
+
+    // Pass 1: paint each cell with its own base tone (running-bond offset
+    // every other row, matching the original layout's intent).
     for (let r = 0; r < rows; r++)
     {
-      const offset = (r % 2 === 0) ? 0 : cw * 0.5;
-      ctx.beginPath();
-      ctx.moveTo(0, r * rh);
-      ctx.lineTo(size, r * rh);
-      ctx.stroke();
-      for (let c = 0; c <= cols; c++)
+      const yOffset = r * rh;
+      const xShift = (r % 2 === 0) ? 0 : cw * 0.5;
+      for (let c = -1; c <= cols; c++)
       {
-        const x = (c * cw + offset) % size;
-        ctx.beginPath();
-        ctx.moveTo(x, r * rh);
-        ctx.lineTo(x, (r + 1) * rh);
-        ctx.stroke();
+        const cx = c * cw + xShift;
+        // Per-stone tone jitter: signed in [-1,1], drives the mix toward
+        // base (lighter) or dark.
+        const jitter = (Math.random() * 2 - 1);
+        ctx.fillStyle = mixColorJitter(0.0, jitter);
+        // Slight sub-pixel rounding to keep cell boundaries snapped to
+        // integer pixels (the mortar pass uses integer-pixel coords too).
+        const x0 = Math.round(cx);
+        const y0 = Math.round(yOffset);
+        const x1 = Math.round(cx + cw);
+        const y1 = Math.round(yOffset + rh);
+        ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+      }
+    }
+
+    // Pass 2: per-cell weathering blotches (scaled to the cell, so they
+    // contribute to per-stone tone variation rather than tile-wide blobs).
+    ctx.globalAlpha = 0.30;
+    ctx.fillStyle = mixColor(1.0);
+    for (let r = 0; r < rows; r++)
+    {
+      const yOffset = r * rh;
+      const xShift = (r % 2 === 0) ? 0 : cw * 0.5;
+      for (let c = 0; c < cols; c++)
+      {
+        const cx = c * cw + xShift + cw * 0.5;
+        // Two small irregular blotches per stone face.
+        for (let b = 0; b < 2; b++)
+        {
+          const bx = cx + (Math.random() - 0.5) * cw * 0.55;
+          const by = yOffset + rh * 0.5 + (Math.random() - 0.5) * rh * 0.55;
+          const br = (cw * 0.10) + Math.random() * (cw * 0.18);
+          ctx.beginPath();
+          ctx.arc(bx, by, br, 0, Math.PI * 2);
+          ctx.fill();
+        }
       }
     }
     ctx.globalAlpha = 1;
+
+    // Pass 3: low-amplitude per-pixel grain. Half the previous amplitude
+    // so it adds surface texture without drowning out structure.
+    const grainAmount = noiseAmount * 0.5;
+    const img = ctx.getImageData(0, 0, size, size);
+    const data = img.data;
+    const dr = baseRGB[0] - darkRGB[0];
+    const dg = baseRGB[1] - darkRGB[1];
+    const db = baseRGB[2] - darkRGB[2];
+    for (let i = 0; i < data.length; i += 4)
+    {
+      const n = (Math.random() - 0.5) * 2 * grainAmount;
+      data[i    ] = clamp8(data[i    ] + n * dr);
+      data[i + 1] = clamp8(data[i + 1] + n * dg);
+      data[i + 2] = clamp8(data[i + 2] + n * db);
+    }
+    ctx.putImageData(img, 0, 0);
+
+    // Pass 4: crisp mortar grid. 3px dark joints with a 1px lighter
+    // highlight along the top/left of each cell to fake a shallow bevel.
+    // The horizontal joint is drawn at every row boundary; the vertical
+    // joints honour the running-bond offset.
+    const mortarDark = mixColor(1.15);                 // a hair darker than darkRGB
+    const mortarHi   = mixColor(-0.25);                // a hair lighter than baseRGB
+    const drawHJoint = (y) =>
+    {
+      // 3px dark band centred on y, then a 1px highlight just above it.
+      ctx.fillStyle = mortarDark;
+      ctx.fillRect(0, Math.round(y) - 1, size, 3);
+      ctx.fillStyle = mortarHi;
+      ctx.fillRect(0, Math.round(y) - 2, size, 1);
+    };
+    const drawVJoint = (x, y0, y1) =>
+    {
+      ctx.fillStyle = mortarDark;
+      ctx.fillRect(Math.round(x) - 1, y0, 3, y1 - y0);
+      ctx.fillStyle = mortarHi;
+      ctx.fillRect(Math.round(x) - 2, y0, 1, y1 - y0);
+    };
+    // Horizontal joints across the full width (wrap-safe at y=0/size).
+    for (let r = 0; r <= rows; r++)
+    {
+      drawHJoint(r * rh);
+    }
+    // Vertical joints honour running-bond offset per row. We iterate
+    // c < cols (not <= cols) because the c=cols joint would wrap to the
+    // same x as c=0, drawing on top of itself.
+    for (let r = 0; r < rows; r++)
+    {
+      const yOffset = r * rh;
+      const xShift = (r % 2 === 0) ? 0 : cw * 0.5;
+      for (let c = 0; c < cols; c++)
+      {
+        const x = (c * cw + xShift);
+        // Wrap into [0,size). When the running-bond offset pushes a joint
+        // off the right edge, the wrap brings it onto the left edge of the
+        // same row, which keeps the tile seamless.
+        const xw = ((x % size) + size) % size;
+        drawVJoint(xw, Math.round(yOffset), Math.round(yOffset + rh));
+      }
+    }
 
     return canvas;
   }
@@ -350,7 +446,14 @@ window.Game.Level = class
     }
 
     const out = new Uint8ClampedArray(w * h * 4);
-    const STRENGTH = 2.5; // amplifies bumpiness; tuned to read well at torch range
+    // Lowered from 2.5 -> 1.4 because the new diffuse has crisper structural
+    // contrast (per-stone tone + 3px mortar with bevel highlight) which
+    // produces stronger Sobel gradients on its own. At 2.5 the resulting
+    // normals saturated and made the lighting jitter at oblique angles on
+    // long surfaces — the surface read as "stretched" because the per-pixel
+    // lighting noise was the dominant cue. 1.4 keeps the tactile bevel
+    // without saturating.
+    const STRENGTH = 1.4;
     for (let y = 0; y < h; y++)
     {
       const ym = (y - 1 + h) % h;
@@ -411,9 +514,14 @@ window.Game.Level = class
     for (let i = 0; i < src.length; i += 4)
     {
       const lum = (src[i] * 0.299 + src[i + 1] * 0.587 + src[i + 2] * 0.114) / 255;
-      // Invert + remap so darkest (mortar) -> 0.75, lightest (face) -> 0.15
+      // Invert + remap. Previously: darkest (mortar) -> 0.75, lightest -> 0.15,
+      // which made the mortar joints flash bright at oblique angles and
+      // contributed to the "streaky" look on long surfaces. Now we cap at
+      // 0.45 on mortar and lift the floor to 0.18 on stone face — the
+      // overall contrast is gentler so highlights spread more uniformly
+      // along the wall instead of running as bright lines along the joints.
       const inv = 1 - lum;
-      const s = 0.15 + Math.max(0, Math.min(1, (inv - 0.2) / 0.6)) * 0.6;
+      const s = 0.18 + Math.max(0, Math.min(1, (inv - 0.2) / 0.6)) * 0.27;
       const v = Math.round(s * 255);
       out[i    ] = v;
       out[i + 1] = v;
