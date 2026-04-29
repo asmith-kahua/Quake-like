@@ -350,8 +350,11 @@
   }
 
   function getLocalState() {
+    // player.position is at eye height (~1.7); peers expect foot-y.
     return {
-      x: player.position.x, y: player.position.y, z: player.position.z,
+      x: player.position.x,
+      y: player.position.y - 1.7,
+      z: player.position.z,
       yaw: player.yaw, pitch: player.pitch,
       weapon: weapon.current === "rocket" ? 1 : 0,
       hp: player.health
@@ -786,7 +789,13 @@
       // If the game has started, show the pause menu (Resume / Quit).
       // Otherwise (very first load) show the start overlay.
       if (started && (!levelComplete || currentLevelIndex < TOTAL_LEVELS - 1)) {
-        if (pauseMenu) pauseMenu.style.display = "flex";
+        if (pauseMenu) {
+          // Show "RESPAWN" instead of "RESUME" when dead.
+          const titleEl = pauseMenu.querySelector("h1");
+          if (titleEl) titleEl.textContent = player.dead ? "YOU DIED" : "PAUSED";
+          if (btnResume) btnResume.textContent = player.dead ? "RESPAWN" : "RESUME";
+          pauseMenu.style.display = "flex";
+        }
       } else if (!started) {
         overlay.style.display = "flex";
       }
@@ -798,6 +807,19 @@
   const btnQuit   = document.getElementById("btn-quit");
   if (btnResume) {
     btnResume.addEventListener("click", () => {
+      // If dead, respawn first (same path as pressing R).
+      if (player.dead) {
+        player.respawn(level);
+        enemies.forEach(en => en.respawn && en.respawn());
+        weapon.rifle.ammo = 50;
+        weapon.rocket.ammo = 5;
+        ui.setAmmo(weapon.ammo);
+        ui.setHealth(player.health);
+        ui.message("RESPAWNED", 1600);
+        prevAlive = enemies.map(en => en.alive);
+        prevDead = false;
+        killsCount = 0;
+      }
       if (pauseMenu) pauseMenu.style.display = "none";
       try { renderer.domElement.requestPointerLock(); } catch (_) { /* ignore */ }
     });
@@ -874,10 +896,9 @@
       lastDamagedBy = null;
     }
     prevDead = player.dead;
-    if (player.dead && document.pointerLockElement) {
-      // release the pointer so the player can click reset / overlay easily
-      try { document.exitPointerLock(); } catch (_) {}
-    }
+    // Don't auto-release pointer on death — that triggered an infinite
+    // pause-menu loop. Player can press R to respawn while pointer-locked,
+    // or hit Esc to access the pause menu (which now shows RESPAWN button).
 
     // Jump sound on takeoff
     if (prevOnGround && !player.onGround && player.velocity.y > 4) {
