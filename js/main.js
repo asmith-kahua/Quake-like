@@ -124,6 +124,19 @@
   if (killFeed)   killFeed.attachTo(document.body);
   if (scoreboard) scoreboard.attachTo(document.body);
 
+  // ---------- In-game chat ----------
+  const chat = (Game.Chat ? new Game.Chat() : null);
+  if (chat) {
+    chat.attachTo(document.body);
+    // Local name is set when multiplayer starts (so [YOU] prefixing works).
+    chat.setLocalName(null);
+  }
+  // Track whether the pointer was locked when chat opened so we can re-acquire on close.
+  let chatWasPointerLocked = false;
+  // Suppress the next pointerlockchange-triggered pause overlay, because chat
+  // intentionally exits pointer lock.
+  let chatSuppressOverlay = false;
+
   // Death attribution: track who damaged us most recently (peerId).
   let lastDamagedBy = null;
   let lastDamagedAt = 0;
@@ -392,6 +405,18 @@
         refreshScoreboard();
       }
     });
+    // Wire chat plumbing now that network exists.
+    if (chat) {
+      chat.setLocalName(network.name || name || null);
+      chat.setSendHandler((text) => {
+        if (network && typeof network.sendChat === "function") {
+          network.sendChat(text);
+        }
+      });
+      network.onChat = ({ from, name: fromName, text }) => {
+        chat.push(fromName || "PLAYER", text);
+      };
+    }
     // Inbound damage from another player.
     network.onHit = (info) => {
       if (!info || !info.dmg || player.dead) return;
@@ -751,6 +776,11 @@
         sound.play("levelStart", { volume: 0.6 });
       }
     } else {
+      // Chat intentionally exits pointer lock — don't pause / show overlay in that case.
+      if (chatSuppressOverlay || (chat && chat.isOpen())) {
+        chatSuppressOverlay = false;
+        return;
+      }
       paused = true;
       if (weapon) weapon.firing = false;
       // If the game has started, show the pause menu (Resume / Quit).
@@ -937,6 +967,54 @@
       killsCount = 0;
     }
   });
+
+  // ---------- Chat open key (T, Quake-style) ----------
+  // Use capture phase so we run before player.js / weapons.js keydown handlers.
+  window.addEventListener("keydown", (e) => {
+    if (!chat) return;
+    if (chat.isOpen()) return;
+    if (e.code !== "KeyT") return;
+    // Don't open if a non-chat input is currently focused.
+    const ae = document.activeElement;
+    if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) {
+      return;
+    }
+    if (player.dead) return;
+    if (paused) return;
+    e.preventDefault();
+    e.stopPropagation();
+    chatWasPointerLocked = (document.pointerLockElement === renderer.domElement);
+    if (chatWasPointerLocked) {
+      // Suppress the pause overlay that the unlock would otherwise trigger.
+      chatSuppressOverlay = true;
+      try { document.exitPointerLock(); } catch (_) { /* ignore */ }
+    }
+    // Clear any held movement keys so the player doesn't keep walking while typing.
+    if (player && player.input) {
+      player.input.forward = false;
+      player.input.back = false;
+      player.input.left = false;
+      player.input.right = false;
+      player.input.jump = false;
+      player.input.sprint = false;
+    }
+    chat.open();
+  }, true);
+
+  // When chat closes (after submit or Esc), re-acquire pointer lock if we had it.
+  // We don't have a chat-close callback API; instead poll on a focusout event.
+  if (chat && chat.inputEl) {
+    chat.inputEl.addEventListener("focusout", () => {
+      // Defer: open() may also momentarily change focus.
+      setTimeout(() => {
+        if (chat.isOpen()) return;
+        if (chatWasPointerLocked && document.pointerLockElement !== renderer.domElement) {
+          try { renderer.domElement.requestPointerLock(); } catch (_) { /* ignore */ }
+        }
+        chatWasPointerLocked = false;
+      }, 0);
+    });
+  }
 
   // ---------- Game loop ----------
   const clock = new THREE.Clock();
